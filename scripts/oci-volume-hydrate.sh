@@ -915,6 +915,9 @@ draw(0)
 
 def consume(part):
     stripped = part.strip()
+    if stripped == "OCI_HYDRATE_PROGRESS_COMPLETE":
+        draw(100)
+        return
     match = re.search(r"(?:^|\s)(\d{1,3})%(?:\s|$)", stripped)
     if match:
         draw(int(match.group(1)))
@@ -1416,6 +1419,9 @@ sync_volume_data(){
         *) printf "Unsupported sync mode: %s\n" "$mode" >&2; exit 2 ;;
       esac
       sync
+      if [ "$progress" = bar ]; then
+        printf "OCI_HYDRATE_PROGRESS_COMPLETE\n"
+      fi
     ' sh "$SYNC_MODE" "$progress_mode")
   if [[ "$progress_mode" == bar ]]; then
     run_with_progress_bar "$description" "${command[@]}"

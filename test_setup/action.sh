@@ -18,7 +18,7 @@ CHECKSUM_JOBS=2
 CAPACITY_MARGIN=10
 PROGRESS_INTERVAL=2
 PROGRESS_STYLE="auto"
-PAYLOAD_MB=512
+PAYLOAD_MB=2048
 KEEP_MIGRATION=false
 MIGRATION_ID="storybook-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 TEMP_BASE="${TMPDIR:-/tmp}"
@@ -50,7 +50,7 @@ Options:
   --capacity-margin PCT  Byte/inode safety margin (default: 10)
   --progress-interval S  Progress message interval (default: 2)
   --progress-style STYLE auto, bar, or log (default: auto)
-  --payload-mb SIZE      Fixture payload size in MiB (default: 512)
+  --payload-mb SIZE      Multi-file fixture size in MiB (default: 2048)
   --keep-migration       Keep the rolled-back destination and migration state
   -h, --help             Show this help
 
@@ -141,7 +141,7 @@ case "$SYNC_MODE" in incremental|full) ;; *) die "--sync-mode must be incrementa
 [[ "$CAPACITY_MARGIN" =~ ^[0-9]+$ && "$CAPACITY_MARGIN" -le 100 ]] || die "--capacity-margin must be between 0 and 100"
 [[ "$PROGRESS_INTERVAL" =~ ^[0-9]+$ && "$PROGRESS_INTERVAL" -gt 0 ]] || die "--progress-interval must be positive"
 case "$PROGRESS_STYLE" in auto|bar|log) ;; *) die "--progress-style must be auto, bar, or log" ;; esac
-[[ "$PAYLOAD_MB" =~ ^[0-9]+$ && "$PAYLOAD_MB" -gt 0 && "$PAYLOAD_MB" -le 2048 ]] || die "--payload-mb must be from 1 through 2048"
+[[ "$PAYLOAD_MB" =~ ^[0-9]+$ && "$PAYLOAD_MB" -ge 64 && "$PAYLOAD_MB" -le 8192 ]] || die "--payload-mb must be from 64 through 8192"
 
 need docker
 need python3
@@ -188,16 +188,23 @@ step "Start both Compose services" 1
 run "${COMPOSE[@]}" up -d
 
 step "Validate the running fixture" 2
-deadline=$((SECONDS + 30))
+deadline=$((SECONDS + 300))
 while (( SECONDS < deadline )); do
   writer_status="$(docker inspect -f '{{.State.Status}}' "$WRITER_CONTAINER" 2>/dev/null || true)"
   reader_status="$(docker inspect -f '{{.State.Status}}' "$READER_CONTAINER" 2>/dev/null || true)"
-  [[ "$writer_status" == running && "$reader_status" == running ]] && break
+  fixture_ready=false
+  if [[ "$writer_status" == running ]] && docker exec "$WRITER_CONTAINER" test -f /data/.fixture-ready 2>/dev/null; then
+    fixture_ready=true
+  fi
+  [[ "$writer_status" == running && "$reader_status" == running && "$fixture_ready" == true ]] && break
   sleep 1
 done
-[[ "${writer_status:-}" == running && "${reader_status:-}" == running ]] || die "Fixture containers did not become running"
+[[ "${writer_status:-}" == running && "${reader_status:-}" == running && "${fixture_ready:-false}" == true ]] ||
+  die "Fixture containers did not become ready within 300 seconds"
 sleep 3
 run "${COMPOSE[@]}" ps
+note "Dataset size and shape exercise large files, thousands of small files, links, permissions, and empty directories:"
+run docker exec "$WRITER_CONTAINER" sh -ceu 'du -sh /data/dataset; printf "regular files: "; find /data/dataset -type f | wc -l; printf "directories: "; find /data/dataset -type d | wc -l; printf "links: "; find /data/dataset -type l | wc -l'
 note "Writer heartbeat proves the source volume is changing:"
 run docker exec "$WRITER_CONTAINER" tail -n 5 /data/heartbeat.log
 note "Reader output proves the second read-only consumer sees the same data:"
@@ -240,7 +247,7 @@ MARKER="storybook-marker-$MIGRATION_ID"
 run docker exec "$WRITER_CONTAINER" sh -ceu 'printf "%s\n" "$1" >> /data/rollback-marker.txt' sh "$MARKER"
 run docker exec "$WRITER_CONTAINER" grep -Fx "$MARKER" /data/rollback-marker.txt
 
-step "Rollback with a $SYNC_MODE reverse synchronization" 8
+step "Rollback using $SYNC_MODE reverse synchronization" 8
 run "$HYDRATOR" rollback "${COMMON[@]}"
 rolled_back_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$WRITER_CONTAINER")"
 [[ "$rolled_back_mount" == "$SOURCE_VOLUME" ]] || die "Writer did not return to the source: $rolled_back_mount"

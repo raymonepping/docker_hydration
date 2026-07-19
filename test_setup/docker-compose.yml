@@ -9,27 +9,46 @@ services:
     container_name: oci_hydrate_test_writer
     restart: unless-stopped
     environment:
-      HYDRATE_TEST_PAYLOAD_MB: ${HYDRATE_TEST_PAYLOAD_MB:-512}
+      HYDRATE_TEST_PAYLOAD_MB: ${HYDRATE_TEST_PAYLOAD_MB:-2048}
     volumes:
       - demo_data:/data
     command: >
       sh -c '
         set -eu
-        mkdir -p /data/samples
+        rm -f /data/.fixture-ready
+        mkdir -p /data/samples /data/live
         [ -f /data/README.txt ] || printf "Demo data for oci-volume-hydrate testing.\nCreated: %s\n" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /data/README.txt
         [ -f /data/samples/notes.txt ] || printf "line one\nline two\nline three\n" > /data/samples/notes.txt
-        payload_mb="$${HYDRATE_TEST_PAYLOAD_MB:-512}"
-        expected_bytes=$$((payload_mb * 1024 * 1024))
-        current_bytes="$$(wc -c < /data/payload.bin 2>/dev/null || printf 0)"
-        if [ "$$current_bytes" -ne "$$expected_bytes" ]; then
-          printf "Seeding %s MiB progress payload...\n" "$$payload_mb"
-          dd if=/dev/urandom of=/data/payload.bin bs=1M count="$$payload_mb" status=none
+        payload_mb="$${HYDRATE_TEST_PAYLOAD_MB:-2048}"
+        dataset_spec="v3:$${payload_mb}MiB"
+        current_spec="$$(cat /data/dataset/.fixture-spec 2>/dev/null || true)"
+        if [ "$$current_spec" != "$$dataset_spec" ]; then
+          printf "Seeding realistic %s MiB multi-file dataset...\n" "$$payload_mb"
+          staging=/data/.dataset-seeding
+          rm -rf "$$staging"
+          mkdir -p "$$staging/large" "$$staging/medium" "$$staging/small" "$$staging/empty" "$$staging/links"
+          large_mb=$$((payload_mb / 2))
+          medium_mb=$$((payload_mb * 3 / 8))
+          small_mb=$$((payload_mb - large_mb - medium_mb))
+          dd if=/dev/urandom bs=1M count="$$large_mb" status=none | split -a 5 -b 134217728 - "$$staging/large/chunk-"
+          dd if=/dev/urandom bs=1M count="$$medium_mb" status=none | split -a 5 -b 4194304 - "$$staging/medium/object-"
+          dd if=/dev/urandom bs=1M count="$$small_mb" status=none | split -a 5 -b 65536 - "$$staging/small/record-"
+          printf "%s\n" "$$dataset_spec" > "$$staging/.fixture-spec"
+          ln "$$staging/large/chunk-aaaaa" "$$staging/links/hardlink-to-first-large"
+          ln -s ../medium/object-aaaaa "$$staging/links/symlink-to-first-medium"
+          chmod 0640 "$$staging/medium/object-aaaaa"
+          rm -rf /data/dataset
+          mv "$$staging" /data/dataset
+          rm -f /data/payload.bin
         fi
         echo "writer started: $$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /data/heartbeat.log
+        touch /data/.fixture-ready
         i=0
         while true; do
           i=$$((i + 1))
           printf "%s tick=%s\n" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$i" >> /data/heartbeat.log
+          shard="$$(printf "%02d" $$((i % 16)))"
+          printf "{\"timestamp\":\"%s\",\"sequence\":%s,\"shard\":%s}\n" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$i" "$$shard" >> "/data/live/events-$${shard}.jsonl"
           sleep 2
         done
       '
