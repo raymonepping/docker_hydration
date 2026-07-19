@@ -1,0 +1,80 @@
+# ── Secrets & credentials ──────────────────────────────────────
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+.vault.*
+*.vault
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.der
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*_rsa
+*_dsa
+*_ecdsa
+*_ed25519
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# ── Editor ────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.orig
+
+# ── Build artifacts ───────────────────────────────────────────
+dist/
+build/
+out/
+*.o
+*.a
+*.so
+*.dylib
+
+# ── Input / output data (keep dirs via .gitkeep, never content)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+# ── Dependencies ──────────────────────────────────────────────
+node_modules/
+vendor/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Logs & generated output ───────────────────────────────────
+*.log
+*.jsonl
+logs/
+tmp/
+temp/
+.tmp/
+
+# ── Coverage & test output ────────────────────────────────────
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+*.lcov
