@@ -4,6 +4,9 @@
 Docker or Podman named volume and can recreate the affected Compose services
 on the verified destination.
 
+The CLI version is read from the repository `VERSION` file, so releases and
+`oci-volume-hydrate.sh --version` always use the same source of truth.
+
 The source volume is always mounted read-only during forward copies, is never
 deleted, and remains the rollback target. Services using it are stopped during
 copying so the destination is internally consistent. If copying, verification,
@@ -16,15 +19,19 @@ the authoritative volume.
 - Python 3
 - Docker with current Compose v2, or Podman with a compatible Compose provider
 - Access to the selected container runtime
-- A local or pullable `alpine:3.20` helper image (override with `HELPER_IMAGE`)
+- Permission to build the repository helper image for incremental synchronization
 
 The Compose provider must support `--profile '*'` and
-`config --format json`; preflight reports a clear error if it does not.
+`config --format json`. The script extracts and records its semantic version,
+requires Docker Compose 2.20+, legacy `docker-compose` 1.29+, or a compatible
+Podman Compose provider 1.0+, and executes feature probes before planning.
 
 The preflight verifies helper capabilities, records the immutable helper image
-ID, measures the source, requires source size plus a 10% free-space margin, and
-fingerprints every Compose input. A later cutover or rollback stops before
-downtime if a Compose file or helper image has changed.
+ID, measures source bytes and inodes, and requires both plus a configurable 10%
+margin. The check is repeated against the actual destination after it is
+created. It also fingerprints every Compose input. A later cutover or rollback
+stops before downtime if a Compose file, Compose version, or helper image has
+changed.
 
 ## Discover volumes
 
@@ -63,8 +70,10 @@ volumes; profile-gated services are included automatically.
 
 ## Plan and hydrate
 
-Validate a migration and save its state without changing containers or
-volumes:
+Validate a migration and save its state without changing application
+containers or volumes. The first non-dry incremental plan may build the local
+`oci-volume-hydrate-helper:<version>` image from
+`docker/volume-helper/Dockerfile`:
 
 ```bash
 ./scripts/oci-volume-hydrate.sh plan \
@@ -74,6 +83,8 @@ volumes:
 ```
 
 For a validation-only preview that writes no state, add `--dry-run`.
+On a new installation, build the helper once before the first incremental dry
+run, or run a non-dry plan and let the script build and pin it automatically.
 
 Run hydration with the same inputs, or resume using the migration ID printed by
 `plan`:
@@ -86,6 +97,27 @@ Hydration creates a uniquely named destination, stops only services consuming
 the source, copies the data, verifies checksums and metadata, generates a
 Compose override, and restarts the original services. It does not cut over
 unless `--auto-cutover` is explicitly supplied.
+
+Incremental rsync is the default for initial hydration, final cutover sync, and
+reverse rollback sync. It enables rsync's delta algorithm even for the local
+volume-to-volume transfer, preserves ownership, modes, links, ACLs, extended
+attributes and sparse files, stays on the mounted filesystem, and deletes
+destination entries that no longer exist at the authoritative source:
+
+```bash
+./scripts/oci-volume-hydrate.sh plan \
+  --compose-file ../vault_reference/docker-compose.yml \
+  --source-volume malware_scan_vault_1_data \
+  --sync-mode incremental
+```
+
+Use `--sync-mode full` to retain the clear-and-tar behavior. The selected mode
+is saved with the migration and cannot change while resuming it. Existing
+migrations created before sync modes were introduced remain on `full` for
+compatibility. Override `HELPER_IMAGE` only with an image containing rsync and
+the validation utilities checked by preflight.
+
+Use `--capacity-margin 20` to change the byte and inode safety margin.
 
 Long copies and manifest builds emit periodic elapsed-time messages. Use
 `--progress-interval 30` to adjust the interval and `--jobs 4` to checksum files
@@ -103,11 +135,13 @@ deterministic.
 
 Cutover recreates only affected services using the generated override and
 waits for them to become running or healthy. Immediately before cutover it
-quiesces consumers, performs and verifies a final source-to-destination sync,
-then validates both container health and the live volume mounts. A failed check
-reverse-syncs to the source and rolls back. A later explicit rollback also
-quiesces consumers and reverse-syncs destination changes before switching.
-Both source and destination volumes are retained.
+rescans the source volume and aborts if its logical service/mount consumers
+differ from the saved plan. After quiescing it verifies that no running consumer
+remains, performs and verifies a final source-to-destination sync, then validates
+both container health and live volume mounts. A failed check reverse-syncs to
+the source and rolls back. A later explicit rollback also quiesces consumers,
+checks the destination has no running consumers, and reverse-syncs destination
+changes before switching. Both source and destination volumes are retained.
 
 ## Locks, state, and cleanup
 

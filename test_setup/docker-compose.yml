@@ -1,0 +1,29 @@
+name: oci_hydrate_test
+
+# Base file: one named volume with one live consumer that keeps writing to
+# it, so a hydration/cutover/rollback run has real, continuously-changing
+# data to preserve — not just a static seed.
+services:
+  writer:
+    image: alpine:3.20
+    container_name: oci_hydrate_test_writer
+    restart: unless-stopped
+    volumes:
+      - demo_data:/data
+    command: >
+      sh -c '
+        set -eu
+        mkdir -p /data/samples
+        [ -f /data/README.txt ] || printf "Demo data for oci-volume-hydrate testing.\nCreated: %s\n" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /data/README.txt
+        [ -f /data/samples/notes.txt ] || printf "line one\nline two\nline three\n" > /data/samples/notes.txt
+        echo "writer started: $$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /data/heartbeat.log
+        i=0
+        while true; do
+          i=$$((i + 1))
+          printf "%s tick=%s\n" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$i" >> /data/heartbeat.log
+          sleep 2
+        done
+      '
+
+volumes:
+  demo_data:

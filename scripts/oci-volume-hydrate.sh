@@ -4,20 +4,36 @@ IFS=$'\n\t'
 umask 077
 
 PROGRAM="${0##*/}"
-VERSION="3.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VERSION_FILE="${PROJECT_ROOT}/VERSION"
+VERSION=""
+if [[ ! -r "$VERSION_FILE" ]]; then
+  printf '%s: version file is missing or unreadable: %s\n' "$PROGRAM" "$VERSION_FILE" >&2
+  exit 1
+fi
+IFS= read -r VERSION < "$VERSION_FILE" || [[ -n "$VERSION" ]]
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
+  printf '%s: invalid version in %s: %s\n' "$PROGRAM" "$VERSION_FILE" "$VERSION" >&2
+  exit 1
+fi
 STATE_ROOT="${STATE_ROOT:-${PROJECT_ROOT}/.volume-hydrations}"
-HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
+HELPER_IMAGE="${HELPER_IMAGE:-}"
+HELPER_CONTEXT="${PROJECT_ROOT}/docker/volume-helper"
+DEFAULT_FULL_HELPER_IMAGE="alpine:3.20"
+DEFAULT_INCREMENTAL_HELPER_IMAGE="oci-volume-hydrate-helper:${VERSION}"
 COMPOSE_FILE=""
 COMPOSE_FILES=()
 COMPOSE_DIGESTS=()
+COMPOSE_VERSION=""
+COMPOSE_CAPABILITIES_CHECKED=false
 PROJECT_NAME=""
 SOURCE_VOLUME=""
 SOURCE_VOLUMES=()
 DEST_VOLUME=""
 MIGRATION_ID=""
 VERIFY_MODE="checksum"
+SYNC_MODE="incremental"
 DRY_RUN=false
 AUTO_CUTOVER=false
 EXECUTE_SET=false
@@ -26,6 +42,7 @@ WAIT_HEALTH=120
 RETENTION_DAYS=30
 CHECKSUM_JOBS=1
 PROGRESS_INTERVAL=15
+CAPACITY_MARGIN_PERCENT=10
 RUNTIME="${RUNTIME:-auto}"
 COMPOSE_PROVIDER="${COMPOSE_PROVIDER:-auto}"
 ENGINE=""
@@ -38,6 +55,7 @@ RECOVERY_TARGET="original"
 TEMP_FILE=""
 HELPER_IMAGE_ID=""
 SOURCE_BYTES=""
+SOURCE_INODES=""
 ACTIVE_PID=""
 ACTIVE_HELPER_CONTAINER=""
 
@@ -107,6 +125,8 @@ Options:
                             Explicit destination name
   --migration-id ID         Resume or operate on an existing migration
   --verify MODE             metadata, size, checksum (default: checksum)
+  --sync-mode MODE          incremental or full (default: incremental)
+  --capacity-margin PERCENT Free-space/inode margin (default: 10)
   --auto-cutover            Cut over after successful hydration
   --execute                 Execute hydrate-set or prune (both default safe)
   --retention-days DAYS     Minimum age for prune candidates (default: 30)
@@ -125,6 +145,7 @@ Safety invariants:
   * Destination is never reused across unrelated migrations.
   * Cutover uses a generated Compose override.
   * Cutover performs a final sync after quiescing consumers.
+  * Consumer drift is checked before cutover and after consumers stop.
   * Rollback reverse-syncs destination changes before recreating services.
   * Failures or interruptions after stopping services trigger recovery.
 USAGE
@@ -344,19 +365,20 @@ save_state(){
   mkdir -p "$d"
   python3 - "$tmp" \
     "$MIGRATION_ID" "$COMPOSE_FILE" "$compose_files_blob" "$compose_digests_blob" \
-    "$PROJECT_NAME" "$SOURCE_VOLUME" "$DEST_VOLUME" "$VERIFY_MODE" "${ENGINE:-$RUNTIME}" \
-    "$COMPOSE_PROVIDER" "${STATUS:-planned}" "${CONSUMERS:-}" "${SERVICES:-}" \
-    "${MOUNT_TARGETS:-}" "$HELPER_IMAGE" "${HELPER_IMAGE_ID:-}" "${SOURCE_BYTES:-}" \
-    "$CHECKSUM_JOBS" "$PROGRESS_INTERVAL" "$WAIT_HEALTH" \
+    "$PROJECT_NAME" "$SOURCE_VOLUME" "$DEST_VOLUME" "$VERIFY_MODE" "$SYNC_MODE" "${ENGINE:-$RUNTIME}" \
+    "$COMPOSE_PROVIDER" "$COMPOSE_VERSION" "${STATUS:-planned}" "${CONSUMERS:-}" "${SERVICES:-}" \
+    "${MOUNT_TARGETS:-}" "$HELPER_IMAGE" "${HELPER_IMAGE_ID:-}" "${SOURCE_BYTES:-}" "${SOURCE_INODES:-}" \
+    "$CHECKSUM_JOBS" "$PROGRESS_INTERVAL" "$WAIT_HEALTH" "$CAPACITY_MARGIN_PERCENT" \
     "${CREATED_UTC:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
 import json
 import os
 import sys
 
 (path, migration_id, compose_file, compose_files, compose_digests, project_name,
- source_volume, dest_volume, verify_mode, runtime, compose_provider, status,
- consumers, services, mount_targets, helper_image, helper_image_id, source_bytes,
- checksum_jobs, progress_interval, wait_health, created_utc, updated_utc) = sys.argv[1:]
+ source_volume, dest_volume, verify_mode, sync_mode, runtime, compose_provider,
+ compose_version, status, consumers, services, mount_targets, helper_image,
+ helper_image_id, source_bytes, source_inodes, checksum_jobs, progress_interval,
+ wait_health, capacity_margin, created_utc, updated_utc) = sys.argv[1:]
 state = {
     "schema_version": 2,
     "migration_id": migration_id,
@@ -367,8 +389,10 @@ state = {
     "source_volume": source_volume,
     "destination_volume": dest_volume,
     "verify_mode": verify_mode,
+    "sync_mode": sync_mode,
     "runtime": runtime,
     "compose_provider": compose_provider,
+    "compose_version": compose_version,
     "status": status,
     "consumers": consumers,
     "services": services,
@@ -376,9 +400,11 @@ state = {
     "helper_image": helper_image,
     "helper_image_id": helper_image_id,
     "source_bytes": int(source_bytes) if source_bytes else None,
+    "source_inodes": int(source_inodes) if source_inodes else None,
     "checksum_jobs": int(checksum_jobs),
     "progress_interval": int(progress_interval),
     "wait_health": int(wait_health),
+    "capacity_margin_percent": int(capacity_margin),
     "created_utc": created_utc,
     "updated_utc": updated_utc,
 }
@@ -418,15 +444,21 @@ mapping = {
     "MIGRATION_ID": "migration_id", "COMPOSE_FILE": "compose_file",
     "PROJECT_NAME": "project_name", "SOURCE_VOLUME": "source_volume",
     "DEST_VOLUME": "destination_volume", "VERIFY_MODE": "verify_mode",
+    "SYNC_MODE": "sync_mode",
     "RUNTIME": "runtime", "COMPOSE_PROVIDER": "compose_provider",
+    "COMPOSE_VERSION": "compose_version",
     "STATUS": "status", "CONSUMERS": "consumers", "SERVICES": "services",
     "MOUNT_TARGETS": "mount_targets", "HELPER_IMAGE": "helper_image",
     "HELPER_IMAGE_ID": "helper_image_id", "SOURCE_BYTES": "source_bytes",
+    "SOURCE_INODES": "source_inodes",
     "CHECKSUM_JOBS": "checksum_jobs", "PROGRESS_INTERVAL": "progress_interval",
-    "WAIT_HEALTH": "wait_health",
+    "WAIT_HEALTH": "wait_health", "CAPACITY_MARGIN_PERCENT": "capacity_margin_percent",
     "CREATED_UTC": "created_utc", "UPDATED_UTC": "updated_utc",
 }
-defaults = {"checksum_jobs": 1, "progress_interval": 15, "wait_health": 120}
+defaults = {
+    "sync_mode": "full", "checksum_jobs": 1, "progress_interval": 15,
+    "wait_health": 120, "capacity_margin_percent": 10,
+}
 for shell_name, json_name in mapping.items():
     value = state.get(json_name, defaults.get(json_name))
     print(f"{shell_name}={shlex.quote('' if value is None else str(value))}")
@@ -477,7 +509,12 @@ files = values.get("COMPOSE_FILES") or ([values.get("COMPOSE_FILE", "")] if valu
 print(f"COMPOSE_FILES=({' '.join(shlex.quote(value) for value in files)})")
 print("COMPOSE_DIGESTS=()")
 print("HELPER_IMAGE_ID=''")
+print("HELPER_IMAGE=alpine:3.20")
 print("SOURCE_BYTES=''")
+print("SOURCE_INODES=''")
+print("SYNC_MODE=full")
+print("COMPOSE_VERSION=''")
+print("CAPACITY_MARGIN_PERCENT=10")
 print("CHECKSUM_JOBS=1")
 print("PROGRESS_INTERVAL=15")
 print("WAIT_HEALTH=120")
@@ -490,6 +527,7 @@ PY
     ENGINE="$RUNTIME"
     resolve_runtime
     resolve_compose_provider
+    check_compose_capabilities "$COMPOSE_VERSION"
   fi
 }
 
@@ -545,7 +583,92 @@ resolve_compose_provider(){
   esac
 }
 
+select_helper_image(){
+  [[ -n "$HELPER_IMAGE" ]] && return
+  case "$SYNC_MODE" in
+    incremental) HELPER_IMAGE="$DEFAULT_INCREMENTAL_HELPER_IMAGE" ;;
+    full) HELPER_IMAGE="$DEFAULT_FULL_HELPER_IMAGE" ;;
+    *) die "Unsupported sync mode: $SYNC_MODE" ;;
+  esac
+}
+
+compose_version_output(){
+  case "$COMPOSE_PROVIDER" in
+    native) "$ENGINE" compose version 2>&1 ;;
+    docker-compose) docker-compose version 2>&1 ;;
+    podman-compose) podman-compose version 2>&1 ;;
+  esac
+}
+
+check_compose_capabilities(){
+  local expected_version="${1:-}" output detected minimum help_output
+  $COMPOSE_CAPABILITIES_CHECKED && return
+  output="$(compose_version_output)" || die "Could not query Compose provider version"
+  detected="$(python3 - "$output" <<'PY'
+import re, sys
+match = re.search(r"(?<!\d)(\d+\.\d+(?:\.\d+)?)(?!\d)", sys.argv[1])
+if not match:
+    raise SystemExit(1)
+parts = match.group(1).split(".")
+print(".".join(parts + ["0"] * (3 - len(parts))))
+PY
+)" || die "Compose provider did not report a semantic version: $output"
+  case "$COMPOSE_PROVIDER:$ENGINE" in
+    native:docker) minimum="2.20.0" ;;
+    docker-compose:docker) minimum="1.29.0" ;;
+    *) minimum="1.0.0" ;;
+  esac
+  python3 - "$detected" "$minimum" <<'PY' || die "Compose $detected is too old; minimum supported version is $minimum"
+import sys
+def version(value):
+    return tuple(int(part) for part in value.split(".")[:3])
+raise SystemExit(0 if version(sys.argv[1]) >= version(sys.argv[2]) else 1)
+PY
+  case "$COMPOSE_PROVIDER" in
+    native) help_output="$("$ENGINE" compose --help 2>&1)" ;;
+    docker-compose) help_output="$(docker-compose --help 2>&1)" ;;
+    podman-compose) help_output="$(podman-compose --help 2>&1)" ;;
+  esac
+  grep -F -- '--profile' <<< "$help_output" >/dev/null ||
+    die "Compose $detected does not advertise required --profile support"
+
+  TEMP_FILE="$(mktemp -t oci-volume-compose-capabilities)"
+  if ! compose config --format json > "$TEMP_FILE"; then
+    die "Compose $detected cannot render JSON with wildcard profiles"
+  fi
+  python3 - "$TEMP_FILE" <<'PY' || die "Compose JSON output does not contain services and volumes objects"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = json.load(handle)
+raise SystemExit(0 if isinstance(config.get("services"), dict) and isinstance(config.get("volumes", {}), dict) else 1)
+PY
+  rm -f "$TEMP_FILE"
+  TEMP_FILE=""
+  if [[ -n "$expected_version" && "$detected" != "$expected_version" ]]; then
+    die "Compose provider changed since planning: expected $expected_version, found $detected"
+  fi
+  COMPOSE_VERSION="$detected"
+  COMPOSE_CAPABILITIES_CHECKED=true
+  log INFO "Compose capabilities verified: $COMPOSE_PROVIDER $COMPOSE_VERSION"
+}
+
 ensure_helper_image(){
+  local helper_definition_sha="" installed_definition_sha=""
+  select_helper_image
+  if [[ "$HELPER_IMAGE" == "$DEFAULT_INCREMENTAL_HELPER_IMAGE" ]]; then
+    [[ -f "$HELPER_CONTEXT/Dockerfile" ]] || die "Default helper Dockerfile is missing: $HELPER_CONTEXT/Dockerfile"
+    helper_definition_sha="$(file_sha256 "$HELPER_CONTEXT/Dockerfile")"
+    if "$ENGINE" image inspect "$HELPER_IMAGE" >/dev/null 2>&1; then
+      installed_definition_sha="$("$ENGINE" image inspect -f '{{ index .Config.Labels "io.hydrate.helper-definition-sha" }}' "$HELPER_IMAGE" 2>/dev/null || true)"
+    fi
+    if [[ "$installed_definition_sha" != "$helper_definition_sha" ]]; then
+      $DRY_RUN && die "Incremental helper image is missing or stale; build it with: $ENGINE build --label io.hydrate.helper-definition-sha=$helper_definition_sha -t $HELPER_IMAGE $HELPER_CONTEXT"
+      log INFO "Building pinned rsync helper before service downtime: $HELPER_IMAGE"
+      "$ENGINE" pull alpine:3.20 >/dev/null
+      "$ENGINE" build --label "io.hydrate.helper-definition-sha=$helper_definition_sha" \
+        -t "$HELPER_IMAGE" "$HELPER_CONTEXT" >/dev/null
+    fi
+  fi
   if ! "$ENGINE" image inspect "$HELPER_IMAGE" >/dev/null 2>&1; then
     $DRY_RUN && die "Helper image is not local: $HELPER_IMAGE (pull it before dry-run)"
     log INFO "Pulling helper image before service downtime: $HELPER_IMAGE"
@@ -553,17 +676,24 @@ ensure_helper_image(){
   fi
   HELPER_IMAGE_ID="$("$ENGINE" image inspect -f '{{.Id}}' "$HELPER_IMAGE")"
   set_helper_container_name
+  # shellcheck disable=SC2016
   "$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" "$HELPER_IMAGE" sh -ceu \
     'command -v tar; command -v find; command -v stat; command -v sha256sum; command -v sort; command -v xargs
      printf "a\0b\0" | sort -z >/dev/null
      printf "a\0" | xargs -0 -r -P 1 printf "%s" >/dev/null
-     stat -c "%F|%n" / >/dev/null' \
+     stat -c "%F|%n" / >/dev/null
+     if [ "$1" = incremental ]; then command -v rsync >/dev/null; fi' sh "$SYNC_MODE" \
     >/dev/null
   ACTIVE_HELPER_CONTAINER=""
 }
 
 verify_helper_image(){
   local current
+  select_helper_image
+  if [[ -z "$HELPER_IMAGE_ID" ]]; then
+    ensure_helper_image
+    return
+  fi
   current="$("$ENGINE" image inspect -f '{{.Id}}' "$HELPER_IMAGE" 2>/dev/null)" ||
     die "Planned helper image is unavailable: $HELPER_IMAGE"
   if [[ -n "$HELPER_IMAGE_ID" && "$current" != "$HELPER_IMAGE_ID" ]]; then
@@ -573,21 +703,65 @@ verify_helper_image(){
 }
 
 measure_source_and_capacity(){
-  local metrics available
+  local metrics available inode_total inode_available required_bytes required_inodes
   set_helper_container_name
   # shellcheck disable=SC2016
   metrics="$("$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" -v "$SOURCE_VOLUME:/source:ro" "$HELPER_IMAGE" sh -ceu '
     bytes=$(du -sk /source | awk "{print \$1 * 1024}")
+    inodes=$(find /source -xdev -exec stat -c . {} + | wc -l | tr -d " ")
     available=$(df -Pk /source | awk "NR == 2 {print \$4 * 1024}")
-    printf "%s\t%s\n" "$bytes" "$available"
+    inode_metrics=$(df -Pi /source | awk "NR == 2 {print \$2 \" \" \$4}")
+    set -- $inode_metrics
+    printf "%s\t%s\t%s\t%s\t%s\n" "$bytes" "$inodes" "$available" "$1" "$2"
   ')"
   ACTIVE_HELPER_CONTAINER=""
-  IFS=$'\t' read -r SOURCE_BYTES available <<< "$metrics"
-  [[ "$SOURCE_BYTES" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || die "Could not measure source size and runtime capacity"
-  log INFO "Source size: ${SOURCE_BYTES} bytes; runtime free space: ${available} bytes"
-  if (( SOURCE_BYTES + SOURCE_BYTES / 10 > available )); then
-    die "Insufficient runtime space: require source size plus 10% safety margin"
+  IFS=$'\t' read -r SOURCE_BYTES SOURCE_INODES available inode_total inode_available <<< "$metrics"
+  [[ "$SOURCE_BYTES" =~ ^[0-9]+$ && "$SOURCE_INODES" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ &&
+     "$inode_total" =~ ^[0-9]+$ && "$inode_available" =~ ^[0-9]+$ ]] ||
+    die "Could not measure source bytes, inodes, and runtime capacity"
+  required_bytes=$((SOURCE_BYTES + (SOURCE_BYTES * CAPACITY_MARGIN_PERCENT + 99) / 100))
+  required_inodes=$((SOURCE_INODES + (SOURCE_INODES * CAPACITY_MARGIN_PERCENT + 99) / 100))
+  log INFO "Source requirements: ${SOURCE_BYTES} bytes, ${SOURCE_INODES} inodes; runtime available: ${available} bytes, ${inode_available} inodes"
+  if (( required_bytes > available )); then
+    die "Insufficient runtime space: require $required_bytes bytes including ${CAPACITY_MARGIN_PERCENT}% margin"
   fi
+  if (( inode_total == 0 )); then
+    log WARN "Runtime filesystem does not report inode limits; inode capacity cannot be enforced"
+  elif (( required_inodes > inode_available )); then
+    die "Insufficient runtime inodes: require $required_inodes including ${CAPACITY_MARGIN_PERCENT}% margin"
+  fi
+}
+
+verify_destination_capacity(){
+  local metrics available inode_total inode_available required_bytes required_inodes
+  assert_destination_owned
+  set_helper_container_name
+  # shellcheck disable=SC2016
+  metrics="$("$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" \
+    -v "$SOURCE_VOLUME:/source:ro" -v "$DEST_VOLUME:/destination:ro" \
+    "$HELPER_IMAGE" sh -ceu '
+      bytes=$(du -sk /source | awk "{print \$1 * 1024}")
+      inodes=$(find /source -xdev -exec stat -c . {} + | wc -l | tr -d " ")
+      available=$(df -Pk /destination | awk "NR == 2 {print \$4 * 1024}")
+      inode_metrics=$(df -Pi /destination | awk "NR == 2 {print \$2 \" \" \$4}")
+      set -- $inode_metrics
+      printf "%s\t%s\t%s\t%s\t%s\n" "$bytes" "$inodes" "$available" "$1" "$2"
+    ')"
+  ACTIVE_HELPER_CONTAINER=""
+  IFS=$'\t' read -r SOURCE_BYTES SOURCE_INODES available inode_total inode_available <<< "$metrics"
+  [[ "$SOURCE_BYTES" =~ ^[0-9]+$ && "$SOURCE_INODES" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ &&
+     "$inode_total" =~ ^[0-9]+$ && "$inode_available" =~ ^[0-9]+$ ]] ||
+    die "Could not measure destination byte and inode capacity"
+  required_bytes=$((SOURCE_BYTES + (SOURCE_BYTES * CAPACITY_MARGIN_PERCENT + 99) / 100))
+  required_inodes=$((SOURCE_INODES + (SOURCE_INODES * CAPACITY_MARGIN_PERCENT + 99) / 100))
+  log INFO "Destination capacity: ${available} bytes and ${inode_available} inodes available; source requires ${SOURCE_BYTES} bytes and ${SOURCE_INODES} inodes"
+  (( required_bytes <= available )) || die "Destination lacks required byte capacity including ${CAPACITY_MARGIN_PERCENT}% margin"
+  if (( inode_total == 0 )); then
+    log WARN "Destination filesystem does not report inode limits; inode capacity cannot be enforced"
+  else
+    (( required_inodes <= inode_available )) || die "Destination lacks required inode capacity including ${CAPACITY_MARGIN_PERCENT}% margin"
+  fi
+  save_state
 }
 
 run_with_progress(){
@@ -640,6 +814,7 @@ inventory(){
   canonicalize_compose_files
   resolve_runtime
   resolve_compose_provider
+  check_compose_capabilities
 
   umask 077
   TEMP_FILE="$(mktemp -t oci-volume-inventory)"
@@ -742,6 +917,7 @@ compose_volume_names(){
   canonicalize_compose_files
   resolve_runtime
   resolve_compose_provider
+  check_compose_capabilities
 
   TEMP_FILE="$(mktemp -t oci-volume-set)"
   compose config --format json > "$TEMP_FILE"
@@ -797,6 +973,8 @@ hydrate_set(){
       --runtime "$RUNTIME"
       --compose-provider "$COMPOSE_PROVIDER"
       --verify "$VERIFY_MODE"
+      --sync-mode "$SYNC_MODE"
+      --capacity-margin "$CAPACITY_MARGIN_PERCENT"
       --jobs "$CHECKSUM_JOBS"
       --progress-interval "$PROGRESS_INTERVAL"
       --wait-health "$WAIT_HEALTH"
@@ -855,6 +1033,30 @@ for container in json.load(sys.stdin):
   MOUNT_TARGETS="$(printf '%s' "$targets" | sed '/^$/d' | sort -u)"
 }
 
+verify_source_consumer_snapshot(){
+  local expected_consumers="$CONSUMERS" expected_services="$SERVICES" expected_targets="$MOUNT_TARGETS"
+  local expected_project="$PROJECT_NAME" actual_targets
+  inspect_consumers
+  actual_targets="$MOUNT_TARGETS"
+  CONSUMERS="$expected_consumers"
+  SERVICES="$expected_services"
+  MOUNT_TARGETS="$expected_targets"
+  PROJECT_NAME="$expected_project"
+  if [[ "$actual_targets" != "$expected_targets" ]]; then
+    log ERROR "Source-volume consumers changed since planning"
+    printf 'Expected service mounts:\n%s\nCurrent service mounts:\n%s\n' \
+      "$expected_targets" "$actual_targets" >&2
+    die "Consumer drift detected; create a new migration plan before cutover"
+  fi
+  log INFO "Consumer snapshot verified before cutover"
+}
+
+assert_no_running_consumers(){
+  local volume="$1" running
+  running="$("$ENGINE" ps -q --filter "volume=$volume")"
+  [[ -z "$running" ]] || die "Volume still has running consumers after quiesce: $volume ($running)"
+}
+
 validate_compose_mapping(){
   umask 077
   TEMP_FILE="$(mktemp -t oci-volume-compose)"
@@ -909,6 +1111,7 @@ preflight(){
   canonicalize_compose_files
   resolve_runtime
   resolve_compose_provider
+  check_compose_capabilities
   "$ENGINE" volume inspect "$SOURCE_VOLUME" >/dev/null 2>&1 || die "Source volume not found: $SOURCE_VOLUME"
   compose config >/dev/null
   inspect_consumers
@@ -977,6 +1180,7 @@ stop_consumers(){
   local svc_array=(); IFS=',' read -r -a svc_array <<< "$SERVICES"
   $DRY_RUN || RESTART_ON_FAILURE=true
   run compose stop "${svc_array[@]}"
+  assert_no_running_consumers "$SOURCE_VOLUME"
   STATUS="consumers-stopped"; save_state
 }
 
@@ -1003,19 +1207,29 @@ start_destination(){
 
 sync_volume_data(){
   local from_volume="$1" to_volume="$2" description="$3"
-  log INFO "$description: $from_volume -> $to_volume"
+  log INFO "$description ($SYNC_MODE): $from_volume -> $to_volume"
   set_helper_container_name
+  # shellcheck disable=SC2016
   run_with_progress "$description" "$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" \
     -v "$from_volume:/source:ro" \
     -v "$to_volume:/destination" \
     "$HELPER_IMAGE" sh -ceu '
+      mode="$1"
       test -d /source && test -d /destination
-      find /destination -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-      cd /source
-      set -o pipefail 2>/dev/null || true
-      tar cpf - . | tar xpf - -C /destination
+      case "$mode" in
+        incremental)
+          rsync -aHAXSx --no-whole-file --numeric-ids --delete --delete-delay --stats /source/ /destination/
+          ;;
+        full)
+          find /destination -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          cd /source
+          set -o pipefail 2>/dev/null || true
+          tar cpf - . | tar xpf - -C /destination
+          ;;
+        *) printf "Unsupported sync mode: %s\n" "$mode" >&2; exit 2 ;;
+      esac
       sync
-    '
+    ' sh "$SYNC_MODE"
   ACTIVE_HELPER_CONTAINER=""
 }
 
@@ -1192,11 +1406,13 @@ cutover(){
     return
   fi
   [[ "$STATUS" == "cutover-ready" || "$STATUS" == "rolled-back" ]] || die "Migration is not cutover-ready; current status: $STATUS"
+  verify_source_consumer_snapshot
 
   RECOVERY_TARGET="original"
   RESTART_ON_FAILURE=true
   log INFO "Quiescing consumers for final synchronization"
   stop_services
+  assert_no_running_consumers "$SOURCE_VOLUME"
   STATUS="cutover-syncing"; save_state
   sync_volume_data "$SOURCE_VOLUME" "$DEST_VOLUME" "Final cutover synchronization"
   if ! verify_volume_pair "$SOURCE_VOLUME" "$DEST_VOLUME" cutover; then
@@ -1222,6 +1438,7 @@ rollback_internal(){
     RECOVERY_TARGET="destination"
     RESTART_ON_FAILURE=true
     stop_services
+    assert_no_running_consumers "$DEST_VOLUME"
     STATUS="rollback-syncing"; save_state
     sync_volume_data "$DEST_VOLUME" "$SOURCE_VOLUME" "Reverse rollback synchronization"
     if ! verify_volume_pair "$DEST_VOLUME" "$SOURCE_VOLUME" rollback; then
@@ -1278,7 +1495,7 @@ hydrate(){
     planned) ensure_destination ;;
   esac
   case "$STATUS" in
-    destination-created) stop_consumers ;;
+    destination-created) verify_destination_capacity; stop_consumers ;;
   esac
   case "$STATUS" in
     consumers-stopped) hydrate_data ;;
@@ -1443,6 +1660,8 @@ parse(){
       -d|--destination-volume) DEST_VOLUME="$(option_value "$1" "${2-}")"; shift 2;;
       --migration-id) MIGRATION_ID="$(option_value "$1" "${2-}")"; shift 2;;
       --verify) VERIFY_MODE="$(option_value "$1" "${2-}")"; shift 2;;
+      --sync-mode) SYNC_MODE="$(option_value "$1" "${2-}")"; shift 2;;
+      --capacity-margin) CAPACITY_MARGIN_PERCENT="$(option_value "$1" "${2-}")"; shift 2;;
       --auto-cutover) AUTO_CUTOVER=true; shift;;
       --execute) EXECUTE_SET=true; shift;;
       --retention-days) RETENTION_DAYS="$(option_value "$1" "${2-}")"; shift 2;;
@@ -1464,10 +1683,12 @@ validate_cli(){
   case "$RUNTIME" in auto|docker|podman) ;; *) die "--runtime must be auto, docker, or podman";; esac
   case "$COMPOSE_PROVIDER" in auto|native|docker-compose|podman-compose) ;; *) die "Invalid --compose-provider: $COMPOSE_PROVIDER";; esac
   case "$VERIFY_MODE" in metadata|size|checksum) ;; *) die "--verify must be metadata, size, or checksum";; esac
+  case "$SYNC_MODE" in incremental|full) ;; *) die "--sync-mode must be incremental or full";; esac
   [[ "$WAIT_HEALTH" =~ ^[0-9]+$ && "$WAIT_HEALTH" -gt 0 ]] || die "--wait-health must be a positive integer"
   [[ "$CHECKSUM_JOBS" =~ ^[0-9]+$ && "$CHECKSUM_JOBS" -gt 0 ]] || die "--jobs must be a positive integer"
   [[ "$PROGRESS_INTERVAL" =~ ^[0-9]+$ && "$PROGRESS_INTERVAL" -gt 0 ]] || die "--progress-interval must be a positive integer"
   [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "--retention-days must be a non-negative integer"
+  [[ "$CAPACITY_MARGIN_PERCENT" =~ ^[0-9]+$ && "$CAPACITY_MARGIN_PERCENT" -le 100 ]] || die "--capacity-margin must be an integer from 0 through 100"
   [[ -n "$STATE_ROOT" ]] || die "--state-root cannot be empty"
   if $EXECUTE_SET && [[ "$CMD" != "hydrate-set" && "$CMD" != "prune" ]]; then
     die "--execute is only valid with hydrate-set or prune"

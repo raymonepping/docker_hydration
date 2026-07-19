@@ -1,0 +1,19 @@
+# Override file: a second, independent consumer of the same named volume.
+# Pass this alongside docker-compose.yml (via a second -f/--compose-file) so
+# the hydration tool has more than one service to discover, quiesce, and
+# recreate — matching the multi-file usage documented in the main README.
+services:
+  reader:
+    image: alpine:3.20
+    container_name: oci_hydrate_test_reader
+    restart: unless-stopped
+    volumes:
+      - demo_data:/data:ro
+    command: >
+      sh -c '
+        while true; do
+          echo "[reader] $$(date -u +%Y-%m-%dT%H:%M:%SZ) tail:"
+          tail -n 3 /data/heartbeat.log 2>/dev/null || echo "(no data yet)"
+          sleep 10
+        done
+      '
