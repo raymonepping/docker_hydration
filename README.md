@@ -4,17 +4,27 @@
 Docker or Podman named volume and can recreate the affected Compose services
 on the verified destination.
 
-The source volume is always mounted read-only, is never deleted, and remains
-the rollback target. Services using it are stopped during copying so the
-destination is internally consistent. If copying, verification, or override
-generation fails, the script attempts to restart those services on the source.
+The source volume is always mounted read-only during forward copies, is never
+deleted, and remains the rollback target. Services using it are stopped during
+copying so the destination is internally consistent. If copying, verification,
+or override generation fails, the script attempts to restart those services on
+the authoritative volume.
 
 ## Requirements
 
 - Bash 3.2 or newer
 - Python 3
-- Docker with Docker Compose, or Podman with a compatible Compose provider
+- Docker with current Compose v2, or Podman with a compatible Compose provider
 - Access to the selected container runtime
+- A local or pullable `alpine:3.20` helper image (override with `HELPER_IMAGE`)
+
+The Compose provider must support `--profile '*'` and
+`config --format json`; preflight reports a clear error if it does not.
+
+The preflight verifies helper capabilities, records the immutable helper image
+ID, measures the source, requires source size plus a 10% free-space margin, and
+fingerprints every Compose input. A later cutover or rollback stops before
+downtime if a Compose file or helper image has changed.
 
 ## Discover volumes
 
@@ -77,6 +87,11 @@ the source, copies the data, verifies checksums and metadata, generates a
 Compose override, and restarts the original services. It does not cut over
 unless `--auto-cutover` is explicitly supplied.
 
+Long copies and manifest builds emit periodic elapsed-time messages. Use
+`--progress-interval 30` to adjust the interval and `--jobs 4` to checksum files
+in parallel; checksum output is sorted before comparison so verification stays
+deterministic.
+
 ## Cut over, inspect, and roll back
 
 ```bash
@@ -87,8 +102,41 @@ unless `--auto-cutover` is explicitly supplied.
 ```
 
 Cutover recreates only affected services using the generated override and
-waits for them to become running or healthy. A failed health or mount check
-triggers rollback. Both source and destination volumes are retained.
+waits for them to become running or healthy. Immediately before cutover it
+quiesces consumers, performs and verifies a final source-to-destination sync,
+then validates both container health and the live volume mounts. A failed check
+reverse-syncs to the source and rolls back. A later explicit rollback also
+quiesces consumers and reverse-syncs destination changes before switching.
+Both source and destination volumes are retained.
+
+## Locks, state, and cleanup
+
+New state is stored as permission-restricted JSON under `.volume-hydrations/`.
+Legacy `state.env` is read by a restricted compatibility parser and is never
+executed. Locks include PID, host, process-start time, and a random ownership
+token; dead local locks are recovered automatically. To inspect or deliberately
+remove one:
+
+```bash
+./scripts/oci-volume-hydrate.sh unlock --migration-id MIGRATION_ID
+./scripts/oci-volume-hydrate.sh unlock --migration-id MIGRATION_ID --force
+```
+
+`--force` is required if the recorded process is still alive or belongs to a
+different host. Verify that no migration process is active before forcing it.
+
+Old inactive migrations can be garbage-collected. Preview is mandatory unless
+`--execute` is explicit:
+
+```bash
+./scripts/oci-volume-hydrate.sh prune --runtime docker --retention-days 30 --dry-run
+./scripts/oci-volume-hydrate.sh prune --runtime docker --retention-days 30 --execute
+```
+
+Only `planned`, `destination-created`, `verification-failed`, and `rolled-back`
+JSON migrations are eligible. Prune refuses mounted volumes or volumes whose
+ownership labels do not match, and never removes a source volume. Active,
+verified, cutover-ready, and active-on-destination migrations are excluded.
 
 ## Important database note
 
