@@ -8,6 +8,8 @@ services:
     image: alpine:3.20
     container_name: oci_hydrate_test_writer
     restart: unless-stopped
+    environment:
+      HYDRATE_TEST_PAYLOAD_MB: ${HYDRATE_TEST_PAYLOAD_MB:-512}
     volumes:
       - demo_data:/data
     command: >
@@ -16,6 +18,13 @@ services:
         mkdir -p /data/samples
         [ -f /data/README.txt ] || printf "Demo data for oci-volume-hydrate testing.\nCreated: %s\n" "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /data/README.txt
         [ -f /data/samples/notes.txt ] || printf "line one\nline two\nline three\n" > /data/samples/notes.txt
+        payload_mb="$${HYDRATE_TEST_PAYLOAD_MB:-512}"
+        expected_bytes=$$((payload_mb * 1024 * 1024))
+        current_bytes="$$(wc -c < /data/payload.bin 2>/dev/null || printf 0)"
+        if [ "$$current_bytes" -ne "$$expected_bytes" ]; then
+          printf "Seeding %s MiB progress payload...\n" "$$payload_mb"
+          dd if=/dev/urandom of=/data/payload.bin bs=1M count="$$payload_mb" status=none
+        fi
         echo "writer started: $$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /data/heartbeat.log
         i=0
         while true; do

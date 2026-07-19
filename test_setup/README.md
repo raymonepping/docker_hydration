@@ -20,6 +20,36 @@ Project name is pinned to `oci_hydrate_test` in the compose file, so the
 runtime volume is always `oci_hydrate_test_demo_data` regardless of which
 directory you run from.
 
+## Run the narrated story
+
+From any directory, `action.sh` runs the complete demonstration and prints each
+command and validation as a numbered step:
+
+```bash
+./test_setup/action.sh
+```
+
+The story first builds the fingerprinted helper when it is absent or stale,
+then starts both services, validates their shared live data, inventories the
+volume, previews and performs hydration, cuts over, writes destination-only
+data, reverse-syncs it during rollback, verifies the original source, and
+prunes only the rolled-back destination and migration state. The writer and
+reader remain running on the original test volume afterward.
+Each invocation uses an isolated temporary state root, and a fixture lock
+prevents concurrent story runs from manipulating the same containers.
+The fixture seeds a 512 MiB payload by default so copy progress remains visible
+on fast local Docker storage; use `--payload-mb` to tune it for your machine.
+
+Incremental rsync is the default. Useful alternatives:
+
+```bash
+./test_setup/action.sh --sync-mode full
+./test_setup/action.sh --payload-mb 1024
+./test_setup/action.sh --progress-style bar
+./test_setup/action.sh --keep-migration
+./test_setup/action.sh --help
+```
+
 ## Bring the stack up
 
 ```bash

@@ -7,21 +7,24 @@ PROGRAM="${0##*/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VERSION_FILE="${PROJECT_ROOT}/VERSION"
-VERSION=""
-if [[ ! -r "$VERSION_FILE" ]]; then
-  printf '%s: version file is missing or unreadable: %s\n' "$PROGRAM" "$VERSION_FILE" >&2
-  exit 1
-fi
-IFS= read -r VERSION < "$VERSION_FILE" || [[ -n "$VERSION" ]]
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
-  printf '%s: invalid version in %s: %s\n' "$PROGRAM" "$VERSION_FILE" "$VERSION" >&2
-  exit 1
+VERSION="unknown"
+VERSION_ERROR=""
+if [[ -r "$VERSION_FILE" ]]; then
+  candidate_version=""
+  IFS= read -r candidate_version < "$VERSION_FILE" || [[ -n "$candidate_version" ]]
+  if [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
+    VERSION="$candidate_version"
+  else
+    VERSION_ERROR="invalid version in $VERSION_FILE: $candidate_version"
+  fi
+else
+  VERSION_ERROR="version file is missing or unreadable: $VERSION_FILE"
 fi
 STATE_ROOT="${STATE_ROOT:-${PROJECT_ROOT}/.volume-hydrations}"
 HELPER_IMAGE="${HELPER_IMAGE:-}"
+HELPER_IMAGE_MANAGED=false
 HELPER_CONTEXT="${PROJECT_ROOT}/docker/volume-helper"
-DEFAULT_FULL_HELPER_IMAGE="alpine:3.20"
-DEFAULT_INCREMENTAL_HELPER_IMAGE="oci-volume-hydrate-helper:${VERSION}"
+HELPER_REPOSITORY="oci-volume-hydrate-helper"
 COMPOSE_FILE=""
 COMPOSE_FILES=()
 COMPOSE_DIGESTS=()
@@ -39,10 +42,15 @@ AUTO_CUTOVER=false
 EXECUTE_SET=false
 FORCE=false
 WAIT_HEALTH=120
+WAIT_HEALTH_SET=false
 RETENTION_DAYS=30
 CHECKSUM_JOBS=1
+CHECKSUM_JOBS_SET=false
 PROGRESS_INTERVAL=15
+PROGRESS_INTERVAL_SET=false
+PROGRESS_STYLE="auto"
 CAPACITY_MARGIN_PERCENT=10
+CAPACITY_MARGIN_SET=false
 RUNTIME="${RUNTIME:-auto}"
 COMPOSE_PROVIDER="${COMPOSE_PROVIDER:-auto}"
 ENGINE=""
@@ -50,6 +58,7 @@ CMD=""
 STATUS=""
 LOCK_DIR=""
 LOCK_TOKEN=""
+LOCK_ERROR=""
 RESTART_ON_FAILURE=false
 RECOVERY_TARGET="original"
 TEMP_FILE=""
@@ -132,6 +141,7 @@ Options:
   --retention-days DAYS     Minimum age for prune candidates (default: 30)
   --jobs COUNT              Parallel checksum workers (default: 1)
   --progress-interval SEC   Progress log interval (default: 15)
+  --progress-style STYLE    auto, bar, or log (default: auto)
   --wait-health SECONDS     Health-check timeout (default: 120)
   --state-root DIR          State directory (default: <project>/.volume-hydrations)
   --force                   Allow unlock of a lock that may still be active
@@ -200,8 +210,18 @@ validate_migration_id(){
     die "Invalid migration ID. Use only letters, digits, '.', '_', and '-' (not path components)."
 }
 
+lock_failure(){
+  local nonfatal="$1"
+  shift
+  LOCK_ERROR="$*"
+  if $nonfatal; then return 1; fi
+  die "$LOCK_ERROR"
+}
+
 acquire_lock(){
+  local nonfatal="${1:-false}"
   local requested owner_file owner_data owner_pid owner_host owner_start current_host current_start
+  LOCK_ERROR=""
   requested="$(state_dir)/.lock"
   [[ "$LOCK_DIR" == "$requested" ]] && return 0
   owner_file="$requested/owner.json"
@@ -224,25 +244,25 @@ PY
         if ! kill -0 "$owner_pid" 2>/dev/null; then
           log WARN "Recovering stale lock owned by dead PID $owner_pid"
           rm -f "$owner_file"
-          rmdir "$requested" 2>/dev/null || die "Cannot recover stale lock: $requested"
-          mkdir "$requested" || die "Cannot acquire recovered lock: $requested"
+          if ! rmdir "$requested" 2>/dev/null; then lock_failure "$nonfatal" "Cannot recover stale lock: $requested"; return 1; fi
+          if ! mkdir "$requested"; then lock_failure "$nonfatal" "Cannot acquire recovered lock: $requested"; return 1; fi
         else
           local observed_start
           observed_start="$(ps -o lstart= -p "$owner_pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
           if [[ -n "$owner_start" && "$observed_start" != "$owner_start" ]]; then
             log WARN "Recovering stale lock after PID reuse: $owner_pid"
             rm -f "$owner_file"
-            rmdir "$requested" 2>/dev/null || die "Cannot recover stale lock: $requested"
-            mkdir "$requested" || die "Cannot acquire recovered lock: $requested"
+            if ! rmdir "$requested" 2>/dev/null; then lock_failure "$nonfatal" "Cannot recover stale lock: $requested"; return 1; fi
+            if ! mkdir "$requested"; then lock_failure "$nonfatal" "Cannot acquire recovered lock: $requested"; return 1; fi
           else
-            die "Migration is locked by active PID $owner_pid on $owner_host"
+            lock_failure "$nonfatal" "Migration is locked by active PID $owner_pid on $owner_host"; return 1
           fi
         fi
       else
-        die "Migration lock ownership cannot be verified; use unlock --migration-id $MIGRATION_ID --force"
+        lock_failure "$nonfatal" "Migration lock ownership cannot be verified; use unlock --migration-id $MIGRATION_ID --force"; return 1
       fi
     else
-      die "Migration has a lock without valid owner metadata; use unlock --migration-id $MIGRATION_ID --force"
+      lock_failure "$nonfatal" "Migration has a lock without valid owner metadata; use unlock --migration-id $MIGRATION_ID --force"; return 1
     fi
   fi
   LOCK_DIR="$requested"
@@ -420,6 +440,9 @@ PY
 
 load_state(){
   local mode="${1:-operational}"
+  local cli_wait_health="$WAIT_HEALTH" cli_checksum_jobs="$CHECKSUM_JOBS"
+  local cli_progress_interval="$PROGRESS_INTERVAL" cli_capacity_margin="$CAPACITY_MARGIN_PERCENT"
+  local saved_value
   need python3
   [[ -n "$MIGRATION_ID" ]] || die "--migration-id is required"
   validate_migration_id
@@ -524,6 +547,22 @@ PY
   fi
   if [[ "${#COMPOSE_FILES[@]}" -eq 0 ]]; then COMPOSE_FILES=("$COMPOSE_FILE"); fi
   if [[ "$mode" != "read-only" ]]; then
+    if $WAIT_HEALTH_SET; then
+      saved_value="$WAIT_HEALTH"; WAIT_HEALTH="$cli_wait_health"
+      [[ "$saved_value" == "$WAIT_HEALTH" ]] || log INFO "CLI override applied: --wait-health $saved_value -> $WAIT_HEALTH"
+    fi
+    if $CHECKSUM_JOBS_SET; then
+      saved_value="$CHECKSUM_JOBS"; CHECKSUM_JOBS="$cli_checksum_jobs"
+      [[ "$saved_value" == "$CHECKSUM_JOBS" ]] || log INFO "CLI override applied: --jobs $saved_value -> $CHECKSUM_JOBS"
+    fi
+    if $PROGRESS_INTERVAL_SET; then
+      saved_value="$PROGRESS_INTERVAL"; PROGRESS_INTERVAL="$cli_progress_interval"
+      [[ "$saved_value" == "$PROGRESS_INTERVAL" ]] || log INFO "CLI override applied: --progress-interval $saved_value -> $PROGRESS_INTERVAL"
+    fi
+    if $CAPACITY_MARGIN_SET; then
+      saved_value="$CAPACITY_MARGIN_PERCENT"; CAPACITY_MARGIN_PERCENT="$cli_capacity_margin"
+      [[ "$saved_value" == "$CAPACITY_MARGIN_PERCENT" ]] || log INFO "CLI override applied: --capacity-margin $saved_value -> $CAPACITY_MARGIN_PERCENT"
+    fi
     ENGINE="$RUNTIME"
     resolve_runtime
     resolve_compose_provider
@@ -584,12 +623,12 @@ resolve_compose_provider(){
 }
 
 select_helper_image(){
+  local definition_sha
   [[ -n "$HELPER_IMAGE" ]] && return
-  case "$SYNC_MODE" in
-    incremental) HELPER_IMAGE="$DEFAULT_INCREMENTAL_HELPER_IMAGE" ;;
-    full) HELPER_IMAGE="$DEFAULT_FULL_HELPER_IMAGE" ;;
-    *) die "Unsupported sync mode: $SYNC_MODE" ;;
-  esac
+  [[ -f "$HELPER_CONTEXT/Dockerfile" ]] || die "Default helper Dockerfile is missing: $HELPER_CONTEXT/Dockerfile"
+  definition_sha="$(file_sha256 "$HELPER_CONTEXT/Dockerfile")"
+  HELPER_IMAGE="${HELPER_REPOSITORY}:${VERSION}-${definition_sha:0:12}"
+  HELPER_IMAGE_MANAGED=true
 }
 
 compose_version_output(){
@@ -655,7 +694,7 @@ PY
 ensure_helper_image(){
   local helper_definition_sha="" installed_definition_sha=""
   select_helper_image
-  if [[ "$HELPER_IMAGE" == "$DEFAULT_INCREMENTAL_HELPER_IMAGE" ]]; then
+  if $HELPER_IMAGE_MANAGED; then
     [[ -f "$HELPER_CONTEXT/Dockerfile" ]] || die "Default helper Dockerfile is missing: $HELPER_CONTEXT/Dockerfile"
     helper_definition_sha="$(file_sha256 "$HELPER_CONTEXT/Dockerfile")"
     if "$ENGINE" image inspect "$HELPER_IMAGE" >/dev/null 2>&1; then
@@ -682,7 +721,7 @@ ensure_helper_image(){
      printf "a\0b\0" | sort -z >/dev/null
      printf "a\0" | xargs -0 -r -P 1 printf "%s" >/dev/null
      stat -c "%F|%n" / >/dev/null
-     if [ "$1" = incremental ]; then command -v rsync >/dev/null; fi' sh "$SYNC_MODE" \
+     if [ "$1" = incremental ]; then command -v rsync >/dev/null; else command -v pv >/dev/null; fi' sh "$SYNC_MODE" \
     >/dev/null
   ACTIVE_HELPER_CONTAINER=""
 }
@@ -764,6 +803,56 @@ verify_destination_capacity(){
   save_state
 }
 
+verify_transition_capacity(){
+  local from_volume="$1" to_volume="$2" label="$3"
+  local metrics from_bytes from_inodes to_bytes to_inodes available inode_total inode_available
+  local byte_delta inode_delta byte_margin inode_margin required_bytes required_inodes
+  "$ENGINE" volume inspect "$from_volume" >/dev/null 2>&1 || die "Transition source volume is missing: $from_volume"
+  "$ENGINE" volume inspect "$to_volume" >/dev/null 2>&1 || die "Transition destination volume is missing: $to_volume"
+  set_helper_container_name
+  # shellcheck disable=SC2016
+  metrics="$("$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" \
+    -v "$from_volume:/source:ro" -v "$to_volume:/destination:ro" \
+    "$HELPER_IMAGE" sh -ceu '
+      source_bytes=$(du -sk /source | awk "{print \$1 * 1024}")
+      source_inodes=$(find /source -xdev -exec stat -c . {} + | wc -l | tr -d " ")
+      destination_bytes=$(du -sk /destination | awk "{print \$1 * 1024}")
+      destination_inodes=$(find /destination -xdev -exec stat -c . {} + | wc -l | tr -d " ")
+      available=$(df -Pk /destination | awk "NR == 2 {print \$4 * 1024}")
+      inode_metrics=$(df -Pi /destination | awk "NR == 2 {print \$2 \" \" \$4}")
+      set -- $inode_metrics
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$source_bytes" "$source_inodes" "$destination_bytes" "$destination_inodes" "$available" "$1" "$2"
+    ')"
+  ACTIVE_HELPER_CONTAINER=""
+  IFS=$'\t' read -r from_bytes from_inodes to_bytes to_inodes available inode_total inode_available <<< "$metrics"
+  [[ "$from_bytes" =~ ^[0-9]+$ && "$from_inodes" =~ ^[0-9]+$ &&
+     "$to_bytes" =~ ^[0-9]+$ && "$to_inodes" =~ ^[0-9]+$ &&
+     "$available" =~ ^[0-9]+$ && "$inode_total" =~ ^[0-9]+$ && "$inode_available" =~ ^[0-9]+$ ]] ||
+    die "Could not measure transition byte and inode headroom"
+
+  byte_margin=$(((from_bytes * CAPACITY_MARGIN_PERCENT + 99) / 100))
+  inode_margin=$(((from_inodes * CAPACITY_MARGIN_PERCENT + 99) / 100))
+  if [[ "$SYNC_MODE" == full ]]; then
+    required_bytes=$((from_bytes + byte_margin))
+    required_inodes=$((from_inodes + inode_margin))
+    available=$((available + to_bytes))
+    inode_available=$((inode_available + to_inodes))
+  else
+    byte_delta=$((from_bytes > to_bytes ? from_bytes - to_bytes : 0))
+    inode_delta=$((from_inodes > to_inodes ? from_inodes - to_inodes : 0))
+    required_bytes=$((byte_delta + byte_margin))
+    required_inodes=$((inode_delta + inode_margin))
+  fi
+  log INFO "$label headroom: require ${required_bytes} bytes and ${required_inodes} inodes; available ${available} bytes and ${inode_available} inodes"
+  (( required_bytes <= available )) || die "$label lacks byte headroom for $SYNC_MODE synchronization"
+  if (( inode_total == 0 )); then
+    log WARN "$label filesystem does not report inode limits; inode headroom cannot be enforced"
+  else
+    (( required_inodes <= inode_available )) || die "$label lacks inode headroom for $SYNC_MODE synchronization"
+  fi
+}
+
 run_with_progress(){
   local label="$1" start elapsed status next_log
   shift
@@ -783,6 +872,90 @@ run_with_progress(){
   ACTIVE_PID=""
   elapsed=$((SECONDS - start))
   [[ "$status" -eq 0 ]] || return "$status"
+  log INFO "$label completed in ${elapsed}s"
+}
+
+progress_bar_enabled(){
+  [[ "$PROGRESS_STYLE" == bar || ( "$PROGRESS_STYLE" == auto && -t 2 && "${TERM:-dumb}" != dumb ) ]]
+}
+
+progress_filter(){
+  local label="$1"
+  python3 -c '
+import re
+import shutil
+import sys
+import time
+
+label = sys.argv[1]
+width = max(12, min(42, shutil.get_terminal_size((80, 24)).columns - len(label) - 28))
+started = time.monotonic()
+last_percent = -1
+pending = []
+drew = False
+fragment = ""
+
+def draw(percent):
+    global drew, last_percent
+    percent = max(0, min(100, percent))
+    if percent == last_percent:
+        return
+    filled = round(width * percent / 100)
+    elapsed = int(time.monotonic() - started)
+    bar = "#" * filled + "-" * (width - filled)
+    sys.stderr.write(
+        f"\r\033[2K{label} [{bar}] "
+        f"{percent:3d}%  {elapsed:>4d}s"
+    )
+    sys.stderr.flush()
+    last_percent = percent
+    drew = True
+
+draw(0)
+
+def consume(part):
+    stripped = part.strip()
+    match = re.search(r"(?:^|\s)(\d{1,3})%(?:\s|$)", stripped)
+    if match:
+        draw(int(match.group(1)))
+    elif stripped.isdigit() and 0 <= int(stripped) <= 100:
+        draw(int(stripped))
+    elif stripped:
+        pending.append(part)
+
+while True:
+    chunk = sys.stdin.buffer.read1(4096)
+    if not chunk:
+        break
+    fragment += chunk.decode(errors="replace")
+    parts = re.split(r"[\r\n]", fragment)
+    fragment = parts.pop()
+    for part in parts:
+        consume(part)
+if fragment:
+    consume(fragment)
+if drew:
+    sys.stderr.write("\n")
+for line in pending:
+    print(line, file=sys.stderr)
+' "$label"
+}
+
+run_with_progress_bar(){
+  local label="$1" start elapsed command_status filter_status
+  local pipeline_status=()
+  shift
+  start=$SECONDS
+  if "$@" 2>&1 | progress_filter "$label"; then
+    pipeline_status=("${PIPESTATUS[@]}")
+  else
+    pipeline_status=("${PIPESTATUS[@]}")
+  fi
+  command_status="${pipeline_status[0]:-1}"
+  filter_status="${pipeline_status[1]:-1}"
+  elapsed=$((SECONDS - start))
+  [[ "$filter_status" -eq 0 ]] || die "Progress renderer failed for $label"
+  [[ "$command_status" -eq 0 ]] || return "$command_status"
   log INFO "$label completed in ${elapsed}s"
 }
 
@@ -977,6 +1150,7 @@ hydrate_set(){
       --capacity-margin "$CAPACITY_MARGIN_PERCENT"
       --jobs "$CHECKSUM_JOBS"
       --progress-interval "$PROGRESS_INTERVAL"
+      --progress-style "$PROGRESS_STYLE"
       --wait-health "$WAIT_HEALTH"
       --state-root "$STATE_ROOT"
     )
@@ -1206,30 +1380,48 @@ start_destination(){
 }
 
 sync_volume_data(){
-  local from_volume="$1" to_volume="$2" description="$3"
+  local from_volume="$1" to_volume="$2" description="$3" progress_mode="log"
+  local command=()
   log INFO "$description ($SYNC_MODE): $from_volume -> $to_volume"
   set_helper_container_name
+  if progress_bar_enabled; then progress_mode="bar"; fi
   # shellcheck disable=SC2016
-  run_with_progress "$description" "$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" \
+  command=("$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" \
     -v "$from_volume:/source:ro" \
     -v "$to_volume:/destination" \
     "$HELPER_IMAGE" sh -ceu '
       mode="$1"
+      progress="$2"
       test -d /source && test -d /destination
       case "$mode" in
         incremental)
-          rsync -aHAXSx --no-whole-file --numeric-ids --delete --delete-delay --stats /source/ /destination/
+          if [ "$progress" = bar ]; then
+            rsync -aHAXSx --no-whole-file --numeric-ids --delete --delete-delay \
+              --info=progress2 --human-readable --no-inc-recursive --stats /source/ /destination/
+          else
+            rsync -aHAXSx --no-whole-file --numeric-ids --delete --delete-delay --stats /source/ /destination/
+          fi
           ;;
         full)
           find /destination -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
           cd /source
           set -o pipefail 2>/dev/null || true
-          tar cpf - . | tar xpf - -C /destination
+          if [ "$progress" = bar ]; then
+            total_bytes=$(du -sb . | awk "{print \$1}")
+            tar cpf - . | pv -n -f -s "$total_bytes" | tar xpf - -C /destination
+          else
+            tar cpf - . | tar xpf - -C /destination
+          fi
           ;;
         *) printf "Unsupported sync mode: %s\n" "$mode" >&2; exit 2 ;;
       esac
       sync
-    ' sh "$SYNC_MODE"
+    ' sh "$SYNC_MODE" "$progress_mode")
+  if [[ "$progress_mode" == bar ]]; then
+    run_with_progress_bar "$description" "${command[@]}"
+  else
+    run_with_progress "$description" "${command[@]}"
+  fi
   ACTIVE_HELPER_CONTAINER=""
 }
 
@@ -1413,6 +1605,7 @@ cutover(){
   log INFO "Quiescing consumers for final synchronization"
   stop_services
   assert_no_running_consumers "$SOURCE_VOLUME"
+  verify_transition_capacity "$SOURCE_VOLUME" "$DEST_VOLUME" "Cutover"
   STATUS="cutover-syncing"; save_state
   sync_volume_data "$SOURCE_VOLUME" "$DEST_VOLUME" "Final cutover synchronization"
   if ! verify_volume_pair "$SOURCE_VOLUME" "$DEST_VOLUME" cutover; then
@@ -1439,6 +1632,7 @@ rollback_internal(){
     RESTART_ON_FAILURE=true
     stop_services
     assert_no_running_consumers "$DEST_VOLUME"
+    verify_transition_capacity "$DEST_VOLUME" "$SOURCE_VOLUME" "Rollback"
     STATUS="rollback-syncing"; save_state
     sync_volume_data "$DEST_VOLUME" "$SOURCE_VOLUME" "Reverse rollback synchronization"
     if ! verify_volume_pair "$DEST_VOLUME" "$SOURCE_VOLUME" rollback; then
@@ -1474,6 +1668,7 @@ hydrate(){
   local resumed=false
   if [[ -n "$MIGRATION_ID" ]] && migration_exists; then
     load_state
+    verify_compose_digests
     verify_helper_image
     resumed=true
   else
@@ -1504,7 +1699,10 @@ hydrate(){
     copied) verify_data ;;
   esac
   case "$STATUS" in
-    verified) generate_override; start_original ;;
+    verified)
+      generate_override
+      if ! $AUTO_CUTOVER; then start_original; fi
+      ;;
   esac
   log INFO "Hydration state: $STATUS"
   if $AUTO_CUTOVER; then
@@ -1549,6 +1747,7 @@ prune_migrations(){
   $EXECUTE_SET && resolve_runtime
 
   local candidates migration destination status age current_status owner role consumers d
+  local candidate_count=0 pruned_count=0 skipped_locked=0
   candidates="$(python3 - "$STATE_ROOT" "$RETENTION_DAYS" <<'PY'
 import datetime as dt
 import json
@@ -1588,6 +1787,7 @@ PY
 
   while IFS='|' read -r migration destination status age; do
     [[ -n "$migration" ]] || continue
+    candidate_count=$((candidate_count + 1))
     log INFO "Prune candidate: $migration (status=$status, age=${age}d, destination=${destination:-none})"
     if $DRY_RUN; then
       continue
@@ -1595,7 +1795,11 @@ PY
 
     MIGRATION_ID="$migration"
     validate_migration_id
-    acquire_lock
+    if ! acquire_lock true; then
+      skipped_locked=$((skipped_locked + 1))
+      log WARN "Skipping locked prune candidate $migration: $LOCK_ERROR"
+      continue
+    fi
     d="$(state_dir)"
     current_status="$(python3 - "$d/state.json" <<'PY'
 import json, sys
@@ -1629,8 +1833,10 @@ for child in directory.iterdir():
 PY
     release_lock
     rmdir "$d" || die "Could not remove pruned state directory: $d"
+    pruned_count=$((pruned_count + 1))
     log INFO "Removed migration state: $migration"
   done <<< "$candidates"
+  log INFO "Prune summary: candidates=$candidate_count, removed=$pruned_count, skipped-locked=$skipped_locked"
 }
 
 parse(){
@@ -1661,13 +1867,14 @@ parse(){
       --migration-id) MIGRATION_ID="$(option_value "$1" "${2-}")"; shift 2;;
       --verify) VERIFY_MODE="$(option_value "$1" "${2-}")"; shift 2;;
       --sync-mode) SYNC_MODE="$(option_value "$1" "${2-}")"; shift 2;;
-      --capacity-margin) CAPACITY_MARGIN_PERCENT="$(option_value "$1" "${2-}")"; shift 2;;
+      --capacity-margin) CAPACITY_MARGIN_PERCENT="$(option_value "$1" "${2-}")"; CAPACITY_MARGIN_SET=true; shift 2;;
       --auto-cutover) AUTO_CUTOVER=true; shift;;
       --execute) EXECUTE_SET=true; shift;;
       --retention-days) RETENTION_DAYS="$(option_value "$1" "${2-}")"; shift 2;;
-      --jobs) CHECKSUM_JOBS="$(option_value "$1" "${2-}")"; shift 2;;
-      --progress-interval) PROGRESS_INTERVAL="$(option_value "$1" "${2-}")"; shift 2;;
-      --wait-health) WAIT_HEALTH="$(option_value "$1" "${2-}")"; shift 2;;
+      --jobs) CHECKSUM_JOBS="$(option_value "$1" "${2-}")"; CHECKSUM_JOBS_SET=true; shift 2;;
+      --progress-interval) PROGRESS_INTERVAL="$(option_value "$1" "${2-}")"; PROGRESS_INTERVAL_SET=true; shift 2;;
+      --progress-style) PROGRESS_STYLE="$(option_value "$1" "${2-}")"; shift 2;;
+      --wait-health) WAIT_HEALTH="$(option_value "$1" "${2-}")"; WAIT_HEALTH_SET=true; shift 2;;
       --state-root) STATE_ROOT="$(option_value "$1" "${2-}")"; shift 2;;
       --force) FORCE=true; shift;;
       --dry-run) DRY_RUN=true; shift;;
@@ -1680,6 +1887,7 @@ parse(){
 }
 
 validate_cli(){
+  [[ -z "$VERSION_ERROR" ]] || die "$VERSION_ERROR"
   case "$RUNTIME" in auto|docker|podman) ;; *) die "--runtime must be auto, docker, or podman";; esac
   case "$COMPOSE_PROVIDER" in auto|native|docker-compose|podman-compose) ;; *) die "Invalid --compose-provider: $COMPOSE_PROVIDER";; esac
   case "$VERIFY_MODE" in metadata|size|checksum) ;; *) die "--verify must be metadata, size, or checksum";; esac
@@ -1687,6 +1895,7 @@ validate_cli(){
   [[ "$WAIT_HEALTH" =~ ^[0-9]+$ && "$WAIT_HEALTH" -gt 0 ]] || die "--wait-health must be a positive integer"
   [[ "$CHECKSUM_JOBS" =~ ^[0-9]+$ && "$CHECKSUM_JOBS" -gt 0 ]] || die "--jobs must be a positive integer"
   [[ "$PROGRESS_INTERVAL" =~ ^[0-9]+$ && "$PROGRESS_INTERVAL" -gt 0 ]] || die "--progress-interval must be a positive integer"
+  case "$PROGRESS_STYLE" in auto|bar|log) ;; *) die "--progress-style must be auto, bar, or log";; esac
   [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "--retention-days must be a non-negative integer"
   [[ "$CAPACITY_MARGIN_PERCENT" =~ ^[0-9]+$ && "$CAPACITY_MARGIN_PERCENT" -le 100 ]] || die "--capacity-margin must be an integer from 0 through 100"
   [[ -n "$STATE_ROOT" ]] || die "--state-root cannot be empty"
