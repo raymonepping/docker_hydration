@@ -141,7 +141,41 @@ gh release view "v$(cat VERSION)"
 gh run list --limit 10
 ```
 
-## 8. After release
+## 8. Update the Homebrew formula
+
+GitHub source-archive checksums exist only after the tag is published. Update
+the formula in a follow-up commit after every release:
+
+```bash
+release_version="$(cat VERSION)"
+archive_url="https://github.com/raymonepping/docker_hydration/archive/refs/tags/v${release_version}.tar.gz"
+
+curl -fsSL "$archive_url" -o "/tmp/docker_hydration-v${release_version}.tar.gz"
+shasum -a 256 "/tmp/docker_hydration-v${release_version}.tar.gz"
+```
+
+- [ ] Update `url` and `sha256` in
+      `Formula/oci-volume-hydrate.rb`.
+- [ ] Run `brew style Formula/oci-volume-hydrate.rb`.
+- [ ] Commit and push the formula update.
+- [ ] Refresh the tap, audit the fully qualified formula, reinstall it from
+      source, and run its test:
+
+```bash
+brew tap raymonepping/docker-hydration \
+  https://github.com/raymonepping/docker_hydration
+brew update
+brew audit --strict raymonepping/docker-hydration/oci-volume-hydrate
+brew reinstall --build-from-source \
+  raymonepping/docker-hydration/oci-volume-hydrate
+brew test raymonepping/docker-hydration/oci-volume-hydrate
+oci-volume-hydrate --version
+oci-volume-hydrate --help
+```
+
+- [ ] Confirm a normal `brew upgrade oci-volume-hydrate` sees the release.
+
+## 9. After release
 
 - [ ] Re-read installation and quick-start commands from a clean checkout.
 - [ ] Confirm `./scripts/oci-volume-hydrate.sh --version` reports the released

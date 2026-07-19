@@ -33,6 +33,40 @@ The Compose provider must support `--profile '*'` and `config --format json`.
 The script checks these capabilities before planning rather than assuming that
 a provider with a recognizable version is compatible.
 
+## Install with Homebrew
+
+Add this repository as a tap and install the CLI:
+
+```bash
+brew tap raymonepping/docker-hydration \
+  https://github.com/raymonepping/docker_hydration
+brew install raymonepping/docker-hydration/oci-volume-hydrate
+```
+
+Then verify the installation:
+
+```bash
+oci-volume-hydrate --version
+oci-volume-hydrate --help
+```
+
+The formula installs Bash and Python, plus the CLI's version and helper-image
+definition. Docker or Podman is deliberately not selected as a formula
+dependency; install and configure the runtime and Compose provider you intend
+to use.
+
+To preserve dry-run's no-write guarantee, it will not build a missing helper
+image. On the first dry run, execute the exact helper build command printed by
+the CLI once and then retry. A non-dry `plan` builds and pins the helper
+automatically before any service downtime.
+
+Upgrade later releases with:
+
+```bash
+brew update
+brew upgrade oci-volume-hydrate
+```
+
 ## Quick start
 
 Inventory the rendered Compose volumes first. Repeat `--compose-file` in the
@@ -261,4 +295,6 @@ native backups such as Vault Raft snapshots, PostgreSQL dumps/base backups, and
 Couchbase backups. Application-specific quiescing and recovery requirements
 still apply.
 
-Run `./scripts/oci-volume-hydrate.sh --help` for the complete CLI reference.
+Run `oci-volume-hydrate --help` after Homebrew installation, or
+`./scripts/oci-volume-hydrate.sh --help` from a source checkout, for the
+complete CLI reference.

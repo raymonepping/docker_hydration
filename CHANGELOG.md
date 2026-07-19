@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamps, device metadata, POSIX ACLs, and extended attributes.
 - A read-only GitHub Actions validation workflow covering Bash and Compose
   checks plus disposable incremental and full Docker hydration lifecycles.
+- A Homebrew formula that installs the CLI, version metadata, helper-image
+  definition, and required shell/Python runtimes as one relocatable package.
 
 ### Changed
 
