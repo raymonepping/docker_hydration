@@ -247,13 +247,16 @@ unlock_migration(){
   [[ -d "$lock_dir" ]] || { log INFO "Migration is not locked: $MIGRATION_ID"; return; }
   current_host="$(hostname 2>/dev/null || printf unknown)"
   if [[ -f "$owner_file" ]]; then
-    owner_data="$(python3 - "$owner_file" <<'PY'
+    if ! owner_data="$(python3 - "$owner_file" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     owner = json.load(handle)
 print(f"{owner.get('pid', '')}\t{owner.get('hostname', '')}\t{owner.get('process_start', '')}")
 PY
-)" || die "Invalid lock owner metadata; use --force to remove it"
+)"; then
+      $FORCE || die "Invalid lock owner metadata; use --force to remove it"
+      owner_data=""
+    fi
     IFS=$'\t' read -r owner_pid owner_host owner_start <<< "$owner_data"
     if [[ "$owner_host" == "$current_host" && "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
       observed_start="$(ps -o lstart= -p "$owner_pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -1098,6 +1101,7 @@ validate_services(){
 cutover(){
   load_state
   [[ "$STATUS" == "cutover-ready" || "$STATUS" == "rolled-back" ]] || die "Migration is not cutover-ready; current status: $STATUS"
+  verify_helper_image
   verify_compose_digests
   assert_destination_owned
 
@@ -1146,6 +1150,7 @@ rollback_internal(){
 
 rollback(){
   load_state
+  verify_helper_image
   verify_compose_digests
   case "$STATUS" in
     active-on-destination|cutover-starting|rollback-syncing) rollback_internal true ;;
@@ -1159,6 +1164,7 @@ hydrate(){
   local resumed=false
   if [[ -n "$MIGRATION_ID" ]] && migration_exists; then
     load_state
+    verify_helper_image
     resumed=true
   else
     create_plan
@@ -1198,8 +1204,24 @@ hydrate(){
 
 show_status(){
   load_state
-  if [[ ! -f "$(state_file)" ]]; then save_state; fi
-  python3 -m json.tool "$(state_file)"
+  if [[ -f "$(state_file)" ]]; then
+    python3 -m json.tool "$(state_file)"
+    return
+  fi
+  python3 - "$MIGRATION_ID" "$STATUS" "$SOURCE_VOLUME" "$DEST_VOLUME" "$RUNTIME" "$PROJECT_NAME" <<'PY'
+import json, sys
+migration_id, status, source, destination, runtime, project = sys.argv[1:]
+print(json.dumps({
+    "schema_version": 1,
+    "legacy_state": True,
+    "migration_id": migration_id,
+    "status": status,
+    "source_volume": source,
+    "destination_volume": destination,
+    "runtime": runtime,
+    "project_name": project,
+}, indent=2, sort_keys=True))
+PY
 }
 list_migrations(){
   [[ -d "$STATE_ROOT" ]] || exit 0
