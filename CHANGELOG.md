@@ -8,8 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- Comprehensive verification of file content, ownership, modes, links,
+  timestamps, device metadata, POSIX ACLs, and extended attributes.
+
 ### Changed
+
+- The managed helper base image is declared once through
+  `HELPER_BASE_IMAGE`, and full-copy mode now preserves ACLs, extended
+  attributes, numeric ownership, and sparse files.
+- New migrations use comprehensive verification by default.
+
 ### Deprecated
 ### Removed
 ### Fixed
+
+- Progress-bar renderer failures now fall back to raw output without masking
+  the copy command's real exit status or causing false recovery.
+
 ### Security

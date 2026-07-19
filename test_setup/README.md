@@ -32,7 +32,8 @@ command and validation as a numbered step:
 The story first builds the fingerprinted helper when it is absent or stale,
 then starts both services, validates their shared live data, inventories the
 volume, previews and performs hydration, cuts over, writes destination-only
-data, reverse-syncs it during rollback, verifies the original source, and
+content, ACLs, and extended attributes, reverse-syncs them during rollback,
+verifies the original source, and
 prunes only the rolled-back destination and migration state. The writer and
 reader remain running on the original test volume afterward.
 Each invocation uses an isolated temporary state root, and a fixture lock
@@ -41,10 +42,11 @@ prevents concurrent story runs from manipulating the same containers.
 The fixture seeds an idempotent 2 GiB dataset by default. Rather than one test
 blob, it contains 128 MiB large chunks, 4 MiB objects, thousands of 64 KiB
 records, nested and empty directories, a hard link, a symbolic link, varied
-permissions, and 16 continuously updated JSONL shards. This exercises transfer
-progress, inode accounting, metadata preservation, parallel checksumming, and
-the small-file behavior seen in real application volumes. Interrupted seeding
-is rebuilt from a staging directory; matching datasets are reused unchanged.
+permissions, an explicit POSIX ACL, an extended attribute, and 16 continuously
+updated JSONL shards. This exercises transfer progress, inode accounting,
+metadata preservation, parallel checksumming, and the small-file behavior seen
+in real application volumes. Interrupted seeding is rebuilt from a staging
+directory; matching datasets are reused unchanged.
 Use `--payload-mb` to tune the total from 64 MiB through 8 GiB.
 
 Incremental rsync is the default. Useful alternatives:

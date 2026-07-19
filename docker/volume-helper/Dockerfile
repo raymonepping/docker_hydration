@@ -1,4 +1,4 @@
-ARG ALPINE_VERSION=3.20
-FROM alpine:${ALPINE_VERSION}
+ARG HELPER_BASE_IMAGE=alpine:3.20
+FROM ${HELPER_BASE_IMAGE}
 
-RUN apk add --no-cache pv rsync
+RUN apk add --no-cache acl attr pv rsync tar

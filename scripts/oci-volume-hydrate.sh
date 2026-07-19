@@ -35,7 +35,7 @@ SOURCE_VOLUME=""
 SOURCE_VOLUMES=()
 DEST_VOLUME=""
 MIGRATION_ID=""
-VERIFY_MODE="checksum"
+VERIFY_MODE="comprehensive"
 SYNC_MODE="incremental"
 DRY_RUN=false
 AUTO_CUTOVER=false
@@ -133,7 +133,8 @@ Options:
   -d, --destination-volume NAME
                             Explicit destination name
   --migration-id ID         Resume or operate on an existing migration
-  --verify MODE             metadata, size, checksum (default: checksum)
+  --verify MODE             metadata, size, checksum, or comprehensive
+                            (default: comprehensive)
   --sync-mode MODE          incremental or full (default: incremental)
   --capacity-margin PERCENT Free-space/inode margin (default: 10)
   --auto-cutover            Cut over after successful hydration
@@ -631,6 +632,13 @@ select_helper_image(){
   HELPER_IMAGE_MANAGED=true
 }
 
+helper_base_image(){
+  local base
+  base="$(awk -F= '$1 == "ARG HELPER_BASE_IMAGE" {print substr($0, index($0, "=") + 1); exit}' "$HELPER_CONTEXT/Dockerfile")"
+  [[ -n "$base" && "$base" != *[[:space:]]* ]] || die "Dockerfile must declare a valid ARG HELPER_BASE_IMAGE=<image>"
+  printf '%s' "$base"
+}
+
 compose_version_output(){
   case "$COMPOSE_PROVIDER" in
     native) "$ENGINE" compose version 2>&1 ;;
@@ -692,7 +700,7 @@ PY
 }
 
 ensure_helper_image(){
-  local helper_definition_sha="" installed_definition_sha=""
+  local helper_definition_sha="" installed_definition_sha="" base_image=""
   select_helper_image
   if $HELPER_IMAGE_MANAGED; then
     [[ -f "$HELPER_CONTEXT/Dockerfile" ]] || die "Default helper Dockerfile is missing: $HELPER_CONTEXT/Dockerfile"
@@ -701,10 +709,12 @@ ensure_helper_image(){
       installed_definition_sha="$("$ENGINE" image inspect -f '{{ index .Config.Labels "io.hydrate.helper-definition-sha" }}' "$HELPER_IMAGE" 2>/dev/null || true)"
     fi
     if [[ "$installed_definition_sha" != "$helper_definition_sha" ]]; then
-      $DRY_RUN && die "Incremental helper image is missing or stale; build it with: $ENGINE build --label io.hydrate.helper-definition-sha=$helper_definition_sha -t $HELPER_IMAGE $HELPER_CONTEXT"
+      $DRY_RUN && die "Managed helper image is missing or stale; build it with: $ENGINE build --build-arg HELPER_BASE_IMAGE=$(helper_base_image) --label io.hydrate.helper-definition-sha=$helper_definition_sha -t $HELPER_IMAGE $HELPER_CONTEXT"
       log INFO "Building pinned rsync helper before service downtime: $HELPER_IMAGE"
-      "$ENGINE" pull alpine:3.20 >/dev/null
-      "$ENGINE" build --label "io.hydrate.helper-definition-sha=$helper_definition_sha" \
+      base_image="$(helper_base_image)"
+      "$ENGINE" pull "$base_image" >/dev/null
+      "$ENGINE" build --build-arg "HELPER_BASE_IMAGE=$base_image" \
+        --label "io.hydrate.helper-definition-sha=$helper_definition_sha" \
         -t "$HELPER_IMAGE" "$HELPER_CONTEXT" >/dev/null
     fi
   fi
@@ -721,7 +731,10 @@ ensure_helper_image(){
      printf "a\0b\0" | sort -z >/dev/null
      printf "a\0" | xargs -0 -r -P 1 printf "%s" >/dev/null
      stat -c "%F|%n" / >/dev/null
-     if [ "$1" = incremental ]; then command -v rsync >/dev/null; else command -v pv >/dev/null; fi' sh "$SYNC_MODE" \
+     if [ "$1" = incremental ]; then command -v rsync >/dev/null; else command -v pv >/dev/null; fi
+     if [ "$2" = comprehensive ]; then
+       command -v getfacl >/dev/null; command -v getfattr >/dev/null
+     fi' sh "$SYNC_MODE" "$VERIFY_MODE" \
     >/dev/null
   ACTIVE_HELPER_CONTAINER=""
 }
@@ -944,20 +957,29 @@ for line in pending:
 ' "$label"
 }
 
+best_effort_progress_filter(){
+  local label="$1" renderer_status
+  progress_filter "$label" || {
+    renderer_status=$?
+    printf '\n' >&2
+    log WARN "Progress renderer exited with status $renderer_status; continuing with raw copy output"
+    cat >&2 || true
+  }
+  return 0
+}
+
 run_with_progress_bar(){
-  local label="$1" start elapsed command_status filter_status
+  local label="$1" start elapsed command_status
   local pipeline_status=()
   shift
   start=$SECONDS
-  if "$@" 2>&1 | progress_filter "$label"; then
+  if "$@" 2>&1 | best_effort_progress_filter "$label"; then
     pipeline_status=("${PIPESTATUS[@]}")
   else
     pipeline_status=("${PIPESTATUS[@]}")
   fi
   command_status="${pipeline_status[0]:-1}"
-  filter_status="${pipeline_status[1]:-1}"
   elapsed=$((SECONDS - start))
-  [[ "$filter_status" -eq 0 ]] || die "Progress renderer failed for $label"
   [[ "$command_status" -eq 0 ]] || return "$command_status"
   log INFO "$label completed in ${elapsed}s"
 }
@@ -1411,9 +1433,12 @@ sync_volume_data(){
           set -o pipefail 2>/dev/null || true
           if [ "$progress" = bar ]; then
             total_bytes=$(du -sb . | awk "{print \$1}")
-            tar cpf - . | pv -n -f -s "$total_bytes" | tar xpf - -C /destination
+            tar --acls --xattrs --xattrs-include="*" --numeric-owner --sparse -cpf - . | \
+              pv -n -f -s "$total_bytes" | \
+              tar --acls --xattrs --xattrs-include="*" --numeric-owner --sparse -xpf - -C /destination
           else
-            tar cpf - . | tar xpf - -C /destination
+            tar --acls --xattrs --xattrs-include="*" --numeric-owner --sparse -cpf - . | \
+              tar --acls --xattrs --xattrs-include="*" --numeric-owner --sparse -xpf - -C /destination
           fi
           ;;
         *) printf "Unsupported sync mode: %s\n" "$mode" >&2; exit 2 ;;
@@ -1463,6 +1488,26 @@ manifest_volume(){
         cd /data
         find . -xdev -type f -print0 | sort -z | xargs -0 -r -n 32 -P "$jobs" sha256sum | LC_ALL=C sort
         find . -xdev ! -type f -print0 | sort -z | xargs -0 -r stat -c "META|%F|%n|%a|%u|%g" 2>/dev/null
+      ' sh "$CHECKSUM_JOBS" > "$output"
+      ;;
+    comprehensive)
+      # Content hashes are parallelized and sorted; metadata, ACL, and xattr
+      # sections are emitted in deterministic path order.
+      # shellcheck disable=SC2016
+      run_with_progress "Comprehensive manifest for $volume" \
+        "$ENGINE" run --rm --name "$ACTIVE_HELPER_CONTAINER" -v "$volume:/data:ro" "$HELPER_IMAGE" sh -ceu '
+        jobs="$1"
+        cd /data
+        printf "CONTENT\n"
+        find . -xdev -type f -print0 | sort -z | xargs -0 -r -n 32 -P "$jobs" sha256sum | LC_ALL=C sort
+        printf "METADATA\n"
+        find . -xdev -print0 | sort -z | xargs -0 -r stat -c "%F|%n|%f|%u|%g|%h|%Y|%t|%T"
+        printf "SYMLINKS\n"
+        find . -xdev -type l -print0 | sort -z | xargs -0 -r -n 1 sh -c '\''printf "%s|" "$1"; readlink -- "$1"'\'' sh
+        printf "ACLS\n"
+        find . -xdev ! -type l -print0 | sort -z | xargs -0 -r getfacl -cpn --
+        printf "XATTRS\n"
+        find . -xdev -print0 | sort -z | xargs -0 -r getfattr -h -d -m - -e hex --
       ' sh "$CHECKSUM_JOBS" > "$output"
       ;;
     *) die "Unknown verification mode: $mode" ;;
@@ -1896,7 +1941,7 @@ validate_cli(){
   [[ -z "$VERSION_ERROR" ]] || die "$VERSION_ERROR"
   case "$RUNTIME" in auto|docker|podman) ;; *) die "--runtime must be auto, docker, or podman";; esac
   case "$COMPOSE_PROVIDER" in auto|native|docker-compose|podman-compose) ;; *) die "Invalid --compose-provider: $COMPOSE_PROVIDER";; esac
-  case "$VERIFY_MODE" in metadata|size|checksum) ;; *) die "--verify must be metadata, size, or checksum";; esac
+  case "$VERIFY_MODE" in metadata|size|checksum|comprehensive) ;; *) die "--verify must be metadata, size, checksum, or comprehensive";; esac
   case "$SYNC_MODE" in incremental|full) ;; *) die "--sync-mode must be incremental or full";; esac
   [[ "$WAIT_HEALTH" =~ ^[0-9]+$ && "$WAIT_HEALTH" -gt 0 ]] || die "--wait-health must be a positive integer"
   [[ "$CHECKSUM_JOBS" =~ ^[0-9]+$ && "$CHECKSUM_JOBS" -gt 0 ]] || die "--jobs must be a positive integer"
@@ -1944,4 +1989,6 @@ main(){
     list) list_migrations;;
   esac
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

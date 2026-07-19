@@ -166,7 +166,7 @@ PLAN_INPUTS=(
   --compose-file "$READER_COMPOSE"
   --source-volume "$SOURCE_VOLUME"
   --sync-mode "$SYNC_MODE"
-  --verify checksum
+  --verify comprehensive
   --jobs "$CHECKSUM_JOBS"
   --capacity-margin "$CAPACITY_MARGIN"
   --progress-interval "$PROGRESS_INTERVAL"
@@ -203,6 +203,13 @@ done
   die "Fixture containers did not become ready within 300 seconds"
 sleep 3
 run "${COMPOSE[@]}" ps
+note "Applying ACL and extended-attribute fixtures for comprehensive verification:"
+run docker run --rm -v "$SOURCE_VOLUME:/data" "$helper_image" sh -ceu '
+  setfacl -m u:1000:r-- /data/dataset/medium/object-aaaaa
+  setfattr -n user.oci-hydrate-test -v comprehensive /data/dataset/small/record-aaaaa
+  getfacl -cpn /data/dataset/medium/object-aaaaa
+  getfattr -d -m user.oci-hydrate-test /data/dataset/small/record-aaaaa
+'
 note "Dataset size and shape exercise large files, thousands of small files, links, permissions, and empty directories:"
 run docker exec "$WRITER_CONTAINER" sh -ceu 'du -sh /data/dataset; printf "regular files: "; find /data/dataset -type f | wc -l; printf "directories: "; find /data/dataset -type d | wc -l; printf "links: "; find /data/dataset -type l | wc -l'
 note "Writer heartbeat proves the source volume is changing:"
@@ -242,17 +249,27 @@ destination_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/
 note "Live writer mount: $destination_mount"
 run docker exec "$WRITER_CONTAINER" tail -n 5 /data/heartbeat.log
 
-step "Create data that exists only after cutover" 7
+step "Create data and metadata that exist only after cutover" 7
 MARKER="storybook-marker-$MIGRATION_ID"
 run docker exec "$WRITER_CONTAINER" sh -ceu 'printf "%s\n" "$1" >> /data/rollback-marker.txt' sh "$MARKER"
 run docker exec "$WRITER_CONTAINER" grep -Fx "$MARKER" /data/rollback-marker.txt
+run docker run --rm -v "$DESTINATION_VOLUME:/data" "$helper_image" sh -ceu '
+  setfacl -m u:1001:rw- /data/dataset/medium/object-aaaaa
+  setfattr -n user.after-cutover -v rollback /data/dataset/small/record-aaaaa
+  getfacl -cpn /data/dataset/medium/object-aaaaa
+  getfattr -d -m user.after-cutover /data/dataset/small/record-aaaaa
+'
 
 step "Rollback using $SYNC_MODE reverse synchronization" 8
 run "$HYDRATOR" rollback "${COMMON[@]}"
 rolled_back_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$WRITER_CONTAINER")"
 [[ "$rolled_back_mount" == "$SOURCE_VOLUME" ]] || die "Writer did not return to the source: $rolled_back_mount"
 run docker exec "$WRITER_CONTAINER" grep -Fx "$MARKER" /data/rollback-marker.txt
-note "The destination-only marker is now present on the original source."
+run docker run --rm -v "$SOURCE_VOLUME:/data:ro" "$helper_image" sh -ceu '
+  getfacl -cpn /data/dataset/medium/object-aaaaa | grep -Fx "user:1001:rw-"
+  test "$(getfattr -n user.after-cutover --only-values /data/dataset/small/record-aaaaa)" = rollback
+'
+note "The destination-only marker, ACL, and extended attribute are now present on the original source."
 run "$HYDRATOR" status "${COMMON[@]}"
 
 step "Clean up only the rolled-back migration" 9
@@ -275,5 +292,5 @@ final_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}
 [[ "$final_mount" == "$SOURCE_VOLUME" ]] || die "Final writer mount is unexpected: $final_mount"
 
 printf '\n%s=== Story complete ===%s\n' "$GREEN" "$RESET"
-note "Hydrate, $SYNC_MODE cutover, destination write, reverse rollback, and prune all passed."
+note "Hydrate, $SYNC_MODE cutover, destination content/metadata writes, reverse rollback, and prune all passed."
 note "Writer and reader remain running on $SOURCE_VOLUME for another run."

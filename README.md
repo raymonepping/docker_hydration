@@ -34,7 +34,9 @@ ID, measures source bytes and inodes, and requires both plus a configurable 10%
 margin. The check is repeated against the actual destination after it is
 created. It also fingerprints every Compose input. A resumed hydration,
 cutover, or rollback stops before changing volumes or containers if a Compose
-file, Compose version, or helper image has changed.
+file, Compose version, or helper image has changed. The managed helper's base
+image comes from `ARG HELPER_BASE_IMAGE` in its Dockerfile; the pre-pull and
+build use that same declaration so the two cannot silently drift apart.
 
 ## Discover volumes
 
@@ -97,7 +99,7 @@ Run hydration with the same inputs, or resume using the migration ID printed by
 ```
 
 Hydration creates a uniquely named destination, stops only services consuming
-the source, copies the data, verifies checksums and metadata, generates a
+the source, copies the data, comprehensively verifies content and metadata, generates a
 Compose override, and restarts the original services. It does not cut over
 unless `--auto-cutover` is explicitly supplied. Auto-cutover proceeds directly
 from the quiesced, verified copy into the final synchronization, avoiding an
@@ -120,7 +122,15 @@ Use `--sync-mode full` to retain the clear-and-tar behavior. The selected mode
 is saved with the migration and cannot change while resuming it. Existing
 migrations created before sync modes were introduced remain on `full` for
 compatibility. Override `HELPER_IMAGE` only with an image containing rsync,
-`pv`, and the validation utilities checked by preflight.
+`pv`, GNU tar, `getfacl`, `getfattr`, and the validation utilities checked by
+preflight.
+
+`--verify comprehensive` is the default for new migrations. It compares file
+content, entry types, ownership, modes, link counts, timestamps, symbolic-link
+targets, device numbers, numeric ACLs, and extended attributes. The lighter
+`metadata`, `size`, and `checksum` modes remain available when their narrower
+guarantees are intentional. A resumed migration keeps the verification mode
+recorded in its state.
 
 Use `--capacity-margin 20` to change the byte and inode safety margin.
 
@@ -136,6 +146,9 @@ Copy operations display a single updating progress bar when stderr is attached
 to an interactive terminal. Non-interactive runs retain timestamped periodic
 messages suitable for CI logs. Use `--progress-style bar` to force the bar or
 `--progress-style log` to force line-oriented output; `auto` is the default.
+The bar renderer is best-effort: if terminal rendering itself fails, the tool
+warns, drains the remaining raw copy output, and preserves the copy command's
+actual result instead of triggering a false migration failure.
 
 ## Cut over, inspect, and roll back
 
