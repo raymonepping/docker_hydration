@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Comprehensive verification of file content, ownership, modes, links,
   timestamps, device metadata, POSIX ACLs, and extended attributes.
+- A read-only GitHub Actions validation workflow covering Bash and Compose
+  checks plus disposable incremental and full Docker hydration lifecycles.
 
 ### Changed
 
@@ -20,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New migrations use comprehensive verification by default.
 
 ### Deprecated
+
 ### Removed
+
 ### Fixed
 
 - Progress-bar renderer failures now fall back to raw output without masking

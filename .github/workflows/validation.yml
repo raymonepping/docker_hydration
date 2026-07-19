@@ -1,0 +1,95 @@
+name: Validation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Static validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - name: Check Bash syntax
+        run: bash -n scripts/oci-volume-hydrate.sh test_setup/action.sh
+
+      - name: Run ShellCheck
+        run: shellcheck scripts/oci-volume-hydrate.sh test_setup/action.sh
+
+      - name: Verify CLI version source
+        shell: bash
+        run: |
+          expected_version="$(tr -d '[:space:]' < VERSION)"
+          reported_version="$(./scripts/oci-volume-hydrate.sh --version | awk '{print $2}')"
+          test "$reported_version" = "$expected_version"
+
+      - name: Render the test Compose model
+        run: |
+          docker compose \
+            -f test_setup/docker-compose.yml \
+            -f test_setup/docker-compose.reader.yml \
+            config --quiet
+
+  integration:
+    name: Docker ${{ matrix.sync-mode }} lifecycle
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sync-mode:
+          - incremental
+          - full
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Show runtime versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run narrated hydration lifecycle
+        run: |
+          ./test_setup/action.sh \
+            --sync-mode "${{ matrix.sync-mode }}" \
+            --payload-mb 256 \
+            --jobs 2 \
+            --progress-style log \
+            --progress-interval 5
+
+      - name: Clean up disposable test resources
+        if: always()
+        shell: bash
+        run: |
+          docker compose \
+            -f test_setup/docker-compose.yml \
+            -f test_setup/docker-compose.reader.yml \
+            down --volumes --remove-orphans || true
+
+          while IFS= read -r volume; do
+            [[ -n "$volume" ]] || continue
+            docker volume rm "$volume" || true
+          done < <(
+            docker volume ls --format '{{.Name}}' |
+              awk '/^oci_hydrate_test_demo_data__hydrated__[0-9]+T[0-9]+Z$/'
+          )

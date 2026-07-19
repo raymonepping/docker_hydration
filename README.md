@@ -1,47 +1,42 @@
 # OCI volume hydration
 
-`oci-volume-hydrate.sh` performs a non-destructive, resumable copy of one
-Docker or Podman named volume and can recreate the affected Compose services
-on the verified destination.
+`oci-volume-hydrate.sh` safely copies a Docker or Podman named volume, verifies
+the result, and recreates only the affected Compose services on the new volume.
+Migrations are non-destructive, resumable, and reversible: the original volume
+is retained and rollback reverse-syncs changes before moving services back.
 
-The CLI version is read from the repository `VERSION` file, so releases and
-`oci-volume-hydrate.sh --version` use the same source of truth. A standalone
-copy can still display help or report version `unknown` when that sibling file
-is absent, while operational commands fail clearly instead of using an
-unversioned helper image.
+This tool is designed for Compose-managed named volumes. It does not modify the
+original Compose files and it never deletes a source volume.
 
-The source volume is always mounted read-only during forward copies, is never
-deleted, and remains the rollback target. Services using it are stopped during
-copying so the destination is internally consistent. If copying, verification,
-or override generation fails, the script attempts to restart those services on
-the authoritative volume.
+## Why use it?
+
+- Discover the real runtime names and consumers of Compose volumes.
+- Hydrate one volume or a selected set into uniquely named destinations.
+- Minimize cutover downtime with an incremental final synchronization.
+- Verify content, ownership, permissions, links, ACLs, and extended attributes.
+- Detect Compose, helper-image, and consumer drift before cutover.
+- Roll back without discarding writes made after cutover.
+- Resume interrupted migrations from permission-restricted JSON state.
 
 ## Requirements
 
 - Bash 3.2 or newer
 - Python 3
-- Docker with current Compose v2, or Podman with a compatible Compose provider
-- Access to the selected container runtime
-- Permission to build the repository helper image for volume synchronization
+- Docker or Podman and access to its daemon or socket
+- A compatible Compose provider:
+  - Docker Compose 2.20 or newer
+  - legacy `docker-compose` 1.29 or newer
+  - compatible Podman Compose provider 1.0 or newer
+- Permission to pull and build the repository's helper image
 
-The Compose provider must support `--profile '*'` and
-`config --format json`. The script extracts and records its semantic version,
-requires Docker Compose 2.20+, legacy `docker-compose` 1.29+, or a compatible
-Podman Compose provider 1.0+, and executes feature probes before planning.
+The Compose provider must support `--profile '*'` and `config --format json`.
+The script checks these capabilities before planning rather than assuming that
+a provider with a recognizable version is compatible.
 
-The preflight verifies helper capabilities, records the immutable helper image
-ID, measures source bytes and inodes, and requires both plus a configurable 10%
-margin. The check is repeated against the actual destination after it is
-created. It also fingerprints every Compose input. A resumed hydration,
-cutover, or rollback stops before changing volumes or containers if a Compose
-file, Compose version, or helper image has changed. The managed helper's base
-image comes from `ARG HELPER_BASE_IMAGE` in its Dockerfile; the pre-pull and
-build use that same declaration so the two cannot silently drift apart.
+## Quick start
 
-## Discover volumes
-
-Commands require a subcommand before their options. Start with `inventory` to
-obtain the rendered runtime names, including external-volume mappings:
+Inventory the rendered Compose volumes first. Repeat `--compose-file` in the
+same order used to start the application:
 
 ```bash
 ./scripts/oci-volume-hydrate.sh inventory \
@@ -49,15 +44,75 @@ obtain the rendered runtime names, including external-volume mappings:
   --runtime docker
 ```
 
-Use the value in the `RUNTIME_VOLUME` column as `--source-volume`.
-`CONFIGURED_CONSUMERS` comes from the rendered Compose model, while
-`LIVE_CONSUMERS` reports current container mounts and states. Hydrated
-destination volumes are listed separately with their migration IDs, making a
-completed cutover visible even though the original Compose file still declares
-the retained source volume.
+Use a value from the `RUNTIME_VOLUME` column as the source. Preview without
+creating state, volumes, or stopping containers:
 
-Preview hydration plans for every existing named volume without changing
-anything:
+```bash
+./scripts/oci-volume-hydrate.sh plan \
+  --compose-file ../vault_reference/docker-compose.yml \
+  --source-volume malware_scan_vault_1_data \
+  --runtime docker \
+  --dry-run
+```
+
+Create a persistent plan and hydrate it:
+
+```bash
+./scripts/oci-volume-hydrate.sh plan \
+  --compose-file ../vault_reference/docker-compose.yml \
+  --source-volume malware_scan_vault_1_data \
+  --runtime docker
+
+./scripts/oci-volume-hydrate.sh hydrate --migration-id MIGRATION_ID
+```
+
+Review the saved status, then cut over. Rollback remains available afterward:
+
+```bash
+./scripts/oci-volume-hydrate.sh status   --migration-id MIGRATION_ID
+./scripts/oci-volume-hydrate.sh cutover  --migration-id MIGRATION_ID
+./scripts/oci-volume-hydrate.sh rollback --migration-id MIGRATION_ID
+```
+
+The normal lifecycle is:
+
+```text
+plan → hydrate → cutover-ready → cutover → active-on-destination
+                                            ↓
+                                      rollback → rolled-back
+```
+
+Hydration stops and restarts only the services consuming the selected volume.
+It does not cut them over unless `--auto-cutover` is explicitly supplied.
+
+## Safety model
+
+The script enforces the following invariants:
+
+- The source is mounted read-only during forward copying and verification.
+- The source is never deleted or reused as a destination.
+- Every migration gets a unique destination and generated Compose override.
+- Compose inputs, provider version, and helper image are fingerprinted in state.
+- Source bytes and inodes are measured with a configurable capacity margin.
+- Capacity is checked again against the destination immediately before syncing.
+- Source consumers are rescanned immediately before cutover.
+- Consumers are quiesced and checked again before the final synchronization.
+- Health and live mount targets are validated after cutover and rollback.
+- Failure or interruption after services stop triggers recovery on the
+  authoritative volume.
+- Rollback reverse-syncs destination changes before recreating services on the
+  source.
+
+The source and destination both remain available after cutover or rollback.
+Deletion is a separate, guarded `prune --execute` operation.
+
+## Inventory and volume sets
+
+`inventory` distinguishes between the consumers rendered from Compose and the
+containers actually mounting each volume. Hydrated destinations are shown in a
+separate table with their migration IDs.
+
+Preview all existing named volumes in a Compose application:
 
 ```bash
 ./scripts/oci-volume-hydrate.sh hydrate-set \
@@ -67,49 +122,19 @@ anything:
   --dry-run
 ```
 
-Repeat `--source-volume` to preview a subset. Set hydration never cuts services
-over automatically. After reviewing the preview, real set hydration additionally
-requires `--execute`; each volume receives its own resumable migration ID. Pass
-every Compose override that defines a live or stopped consumer of the selected
-volumes; profile-gated services are included automatically.
+Repeat `--source-volume` to select a subset. A real set hydration additionally
+requires `--execute`, processes volumes sequentially, and never automatically
+cuts them over. Each volume receives its own migration ID for individual review.
 
-## Plan and hydrate
+Always provide every Compose override that defines a live or stopped consumer
+of the selected volumes. Profile-gated services are included automatically.
 
-Validate a migration and save its state without changing application
-containers or volumes. The first non-dry incremental plan may build the local
-`oci-volume-hydrate-helper:<version>-<definition-hash>` image from
-`docker/volume-helper/Dockerfile`:
+## Synchronization and verification
 
-```bash
-./scripts/oci-volume-hydrate.sh plan \
-  --compose-file ../vault_reference/docker-compose.yml \
-  --source-volume malware_scan_vault_1_data \
-  --runtime docker
-```
-
-For a validation-only preview that writes no state, add `--dry-run`.
-On a new installation, build the helper once before the first incremental dry
-run, or run a non-dry plan and let the script build and pin it automatically.
-
-Run hydration with the same inputs, or resume using the migration ID printed by
-`plan`:
-
-```bash
-./scripts/oci-volume-hydrate.sh hydrate --migration-id MIGRATION_ID
-```
-
-Hydration creates a uniquely named destination, stops only services consuming
-the source, copies the data, comprehensively verifies content and metadata, generates a
-Compose override, and restarts the original services. It does not cut over
-unless `--auto-cutover` is explicitly supplied. Auto-cutover proceeds directly
-from the quiesced, verified copy into the final synchronization, avoiding an
-unnecessary intermediate restart on the source.
-
-Incremental rsync is the default for initial hydration, final cutover sync, and
-reverse rollback sync. It enables rsync's delta algorithm even for the local
-volume-to-volume transfer, preserves ownership, modes, links, ACLs, extended
-attributes and sparse files, stays on the mounted filesystem, and deletes
-destination entries that no longer exist at the authoritative source:
+Incremental rsync is the default for initial hydration, final cutover, and
+reverse rollback. It preserves ownership, modes, hard and symbolic links,
+ACLs, extended attributes, and sparse files. It also removes target entries
+that no longer exist on the authoritative side.
 
 ```bash
 ./scripts/oci-volume-hydrate.sh plan \
@@ -118,95 +143,122 @@ destination entries that no longer exist at the authoritative source:
   --sync-mode incremental
 ```
 
-Use `--sync-mode full` to retain the clear-and-tar behavior. The selected mode
-is saved with the migration and cannot change while resuming it. Existing
-migrations created before sync modes were introduced remain on `full` for
-compatibility. Override `HELPER_IMAGE` only with an image containing rsync,
-`pv`, GNU tar, `getfacl`, `getfattr`, and the validation utilities checked by
-preflight.
+Use `--sync-mode full` for a clear-and-GNU-tar copy. Full mode preserves the
+same important filesystem properties. The synchronization mode is immutable
+after planning; older saved migrations retain their recorded behavior.
 
-`--verify comprehensive` is the default for new migrations. It compares file
-content, entry types, ownership, modes, link counts, timestamps, symbolic-link
-targets, device numbers, numeric ACLs, and extended attributes. The lighter
-`metadata`, `size`, and `checksum` modes remain available when their narrower
-guarantees are intentional. A resumed migration keeps the verification mode
-recorded in its state.
+New migrations default to `--verify comprehensive`, which compares:
 
-Use `--capacity-margin 20` to change the byte and inode safety margin.
+- regular-file content hashes;
+- entry types, numeric ownership, raw modes, link counts, and timestamps;
+- symbolic-link targets and device numbers;
+- numeric POSIX ACLs;
+- extended attributes.
 
-Long copies and manifest builds emit periodic elapsed-time messages. Use
-`--progress-interval 30` to adjust the interval and `--jobs 4` to checksum files
-in parallel; checksum output is sorted before comparison so verification stays
-deterministic. On resumed operational commands, explicitly supplied
-`--wait-health`, `--jobs`, `--progress-interval`, and `--capacity-margin`
-override their saved values and the change is logged. Migration invariants such
-as synchronization and verification mode continue to come from saved state.
+The lighter `metadata`, `size`, and `checksum` modes remain available when
+their narrower guarantees are intentional. Verification mode is saved as a
+migration invariant and cannot silently change during resume.
 
-Copy operations display a single updating progress bar when stderr is attached
-to an interactive terminal. Non-interactive runs retain timestamped periodic
-messages suitable for CI logs. Use `--progress-style bar` to force the bar or
-`--progress-style log` to force line-oriented output; `auto` is the default.
-The bar renderer is best-effort: if terminal rendering itself fails, the tool
-warns, drains the remaining raw copy output, and preserves the copy command's
-actual result instead of triggering a false migration failure.
+Checksums are parallelizable with `--jobs 4` and sorted before comparison for
+deterministic results. Use `--capacity-margin 20` to change the default 10%
+byte and inode headroom.
 
-## Cut over, inspect, and roll back
+## Progress output
+
+Interactive copy operations show a single updating progress bar. Redirected or
+CI output uses timestamped progress lines instead.
 
 ```bash
-./scripts/oci-volume-hydrate.sh status   --migration-id MIGRATION_ID
-./scripts/oci-volume-hydrate.sh cutover  --migration-id MIGRATION_ID
-./scripts/oci-volume-hydrate.sh rollback --migration-id MIGRATION_ID
-./scripts/oci-volume-hydrate.sh list
+./scripts/oci-volume-hydrate.sh hydrate \
+  --migration-id MIGRATION_ID \
+  --progress-style bar \
+  --progress-interval 5
 ```
 
-Cutover recreates only affected services using the generated override and
-waits for them to become running or healthy. Immediately before cutover it
-rescans the source volume and aborts if its logical service/mount consumers
-differ from the saved plan. After quiescing it verifies that no running consumer
-remains, performs and verifies a final source-to-destination sync, then validates
-both container health and live volume mounts. A failed check reverse-syncs to
-the source and rolls back. A later explicit rollback also quiesces consumers,
-checks the destination has no running consumers, and reverse-syncs destination
-changes before switching. Immediately before each directional sync, the script
-remeasures both volumes and the target filesystem and enforces byte and inode
-headroom with the configured safety margin. Both source and destination volumes
-are retained.
+`--progress-style auto` is the default; `bar` and `log` force either form. The
+renderer is best-effort: if it fails, raw copy output is drained and shown, and
+the copy command's actual exit status remains authoritative.
 
-## Locks, state, and cleanup
+## State, locks, and cleanup
 
-New state is stored as permission-restricted JSON under `.volume-hydrations/`.
-Legacy `state.env` is read by a restricted compatibility parser and is never
-executed. Locks include PID, host, process-start time, and a random ownership
-token; dead local locks are recovered automatically. To inspect or deliberately
-remove one:
+State is stored as permission-restricted JSON under `.volume-hydrations/` by
+default. Legacy `state.env` files are parsed by a restricted compatibility
+reader and are never executed. Explicitly supplied operational settings such as
+health timeout, checksum jobs, progress interval, and capacity margin override
+saved values with a logged notice; migration invariants remain pinned.
+
+Locks record PID, hostname, process start time, and a random ownership token.
+Dead local locks are recovered automatically. Inspect or remove a stale lock:
 
 ```bash
 ./scripts/oci-volume-hydrate.sh unlock --migration-id MIGRATION_ID
 ./scripts/oci-volume-hydrate.sh unlock --migration-id MIGRATION_ID --force
 ```
 
-`--force` is required if the recorded process is still alive or belongs to a
-different host. Verify that no migration process is active before forcing it.
+Only force an unlock after confirming that no migration process is active.
 
-Old inactive migrations can be garbage-collected. Preview is mandatory unless
-`--execute` is explicit:
+Preview garbage collection before executing it:
 
 ```bash
-./scripts/oci-volume-hydrate.sh prune --runtime docker --retention-days 30 --dry-run
-./scripts/oci-volume-hydrate.sh prune --runtime docker --retention-days 30 --execute
+./scripts/oci-volume-hydrate.sh prune \
+  --runtime docker \
+  --retention-days 30 \
+  --dry-run
+
+./scripts/oci-volume-hydrate.sh prune \
+  --runtime docker \
+  --retention-days 30 \
+  --execute
 ```
 
-Only `planned`, `destination-created`, `verification-failed`, and `rolled-back`
-JSON migrations are eligible. Prune refuses mounted volumes or volumes whose
-ownership labels do not match, and never removes a source volume. Active,
-verified, cutover-ready, and active-on-destination migrations are excluded.
-If an eligible migration is actively locked, prune logs and skips it, continues
-with the remaining candidates, and reports removed and skipped-lock totals.
+Prune considers only inactive `planned`, `destination-created`,
+`verification-failed`, and `rolled-back` migrations. It refuses mounted or
+mislabeled destinations, never removes a source, and skips actively locked
+candidates while continuing with the rest.
 
-## Important database note
+## Helper image
 
-Hydration is a storage-level migration, not a substitute for application-native
-backups. Keep separate Vault Raft snapshots and native PostgreSQL/Couchbase
-backups before migrating those services.
+The managed helper image is tagged with the CLI version and a Dockerfile
+fingerprint. Its immutable image ID is then pinned in migration state. The base
+image is declared once through `ARG HELPER_BASE_IMAGE` in
+`docker/volume-helper/Dockerfile`; pre-pull and build use that declaration.
 
-Run `./scripts/oci-volume-hydrate.sh --help` for all options.
+If `HELPER_IMAGE` is overridden, the custom image must contain rsync, `pv`, GNU
+tar, `getfacl`, `getfattr`, and the standard validation utilities checked by
+preflight.
+
+## Test safely
+
+The disposable test project exercises a realistic multi-consumer volume with a
+2 GiB mixed dataset, continuous writes, links, permissions, ACLs, and extended
+attributes:
+
+```bash
+./test_setup/action.sh
+```
+
+It narrates inventory, dry-run, hydration, cutover, destination-only mutations,
+reverse rollback, verification, and guarded pruning. See
+[`test_setup/README.md`](test_setup/README.md) for options and manual commands.
+
+## Continuous validation
+
+The independent `Validation` GitHub Actions workflow runs Bash syntax checks,
+ShellCheck, CLI/VERSION consistency, and Compose rendering. After those pass,
+isolated Docker jobs exercise both incremental and full hydration lifecycles
+with 256 MiB disposable fixtures.
+
+The workflow runs for pull requests, pushes to `main`, and manual dispatch. It
+has read-only repository permissions and does not create commits, tags, or
+releases. Publishing and version changes remain the responsibility of the
+project's separate `commit_gh` workflow.
+
+## Scope and database warning
+
+This is a filesystem-level volume migration tool, not an application-consistent
+database backup utility. Before migrating stateful services, retain independent
+native backups such as Vault Raft snapshots, PostgreSQL dumps/base backups, and
+Couchbase backups. Application-specific quiescing and recovery requirements
+still apply.
+
+Run `./scripts/oci-volume-hydrate.sh --help` for the complete CLI reference.

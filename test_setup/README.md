@@ -1,119 +1,160 @@
-# Test setup for oci-volume-hydrate.sh
+# Safe end-to-end test setup
 
-A disposable Compose project to exercise the hydration tool end to end
-without touching a real stack.
+This disposable Compose project exercises `oci-volume-hydrate.sh` without
+touching an application stack. It uses one named volume and two consumers:
 
-- `docker-compose.yml` — one named volume (`demo_data`) and one live
-  consumer (`writer`) that seeds a few files on first boot, then keeps
-  appending timestamped lines to `heartbeat.log` every 2 seconds for as
-  long as the container runs. This gives every hydrate/cutover/rollback run
-  real, continuously-changing data instead of a static fixture, so you can
-  check afterwards that no ticks were lost.
-- `docker-compose.reader.yml` — an override file adding a second consumer
-  (`reader`) that mounts the same volume read-only and tails the heartbeat
-  log. Pass both files together (`-f docker-compose.yml -f
-  docker-compose.reader.yml`) so the tool has more than one service to
-  discover, quiesce, and recreate — the same multi-file pattern used against
-  real stacks.
+- `writer` seeds a mixed dataset and continuously appends timestamped heartbeat
+  and JSONL records.
+- `reader` mounts the same volume read-only and periodically displays the data
+  it can observe.
 
-Project name is pinned to `oci_hydrate_test` in the compose file, so the
-runtime volume is always `oci_hydrate_test_demo_data` regardless of which
-directory you run from.
+The Compose project name is fixed to `oci_hydrate_test`, so the source volume
+is always `oci_hydrate_test_demo_data` regardless of the current directory.
 
-## Run the narrated story
+## What the fixture contains
 
-From any directory, `action.sh` runs the complete demonstration and prints each
-command and validation as a numbered step:
+The default dataset is an idempotent 2 GiB fixture with:
+
+- 128 MiB large chunks and 4 MiB medium objects;
+- thousands of 64 KiB records;
+- nested and empty directories;
+- a hard link and a symbolic link;
+- varied file permissions;
+- an explicit numeric POSIX ACL;
+- an extended attribute;
+- 16 continuously updated JSONL shards and a heartbeat log.
+
+Seeding uses a staging directory, so an interrupted build is replaced safely.
+A matching completed dataset is reused on later runs. Use `--payload-mb` to set
+the fixture size from 64 MiB through 8 GiB.
+
+## Run the narrated lifecycle
+
+From the repository root—or any other directory—run:
 
 ```bash
 ./test_setup/action.sh
 ```
 
-The story first builds the fingerprinted helper when it is absent or stale,
-then starts both services, validates their shared live data, inventories the
-volume, previews and performs hydration, cuts over, writes destination-only
-content, ACLs, and extended attributes, reverse-syncs them during rollback,
-verifies the original source, and
-prunes only the rolled-back destination and migration state. The writer and
-reader remain running on the original test volume afterward.
-Each invocation uses an isolated temporary state root, and a fixture lock
-prevents concurrent story runs from manipulating the same containers.
+The story prints every command and validation while it:
 
-The fixture seeds an idempotent 2 GiB dataset by default. Rather than one test
-blob, it contains 128 MiB large chunks, 4 MiB objects, thousands of 64 KiB
-records, nested and empty directories, a hard link, a symbolic link, varied
-permissions, an explicit POSIX ACL, an extended attribute, and 16 continuously
-updated JSONL shards. This exercises transfer progress, inode accounting,
-metadata preservation, parallel checksumming, and the small-file behavior seen
-in real application volumes. Interrupted seeding is rebuilt from a staging
-directory; matching datasets are reused unchanged.
-Use `--payload-mb` to tune the total from 64 MiB through 8 GiB.
+1. Builds or reuses the versioned, fingerprinted helper image.
+2. Starts the writer and read-only reader.
+3. Validates the fixture, ACL, xattr, and continuous writes.
+4. Inventories the source volume and both consumers.
+5. Previews the migration with `--dry-run`.
+6. Hydrates and comprehensively verifies a unique destination.
+7. Final-syncs and cuts both consumers over.
+8. Creates destination-only content, an ACL, and an xattr.
+9. Reverse-syncs and rolls back to the source.
+10. Proves all destination-only changes reached the original source.
+11. Previews and executes guarded pruning for only that migration.
+12. Confirms both services are running on the retained source volume.
 
-Incremental rsync is the default. Useful alternatives:
+Each invocation uses an isolated temporary state root. A fixture-level lock
+prevents concurrent story runs from manipulating the shared test containers.
+On failure, the fixture and migration state are retained for inspection.
+
+Useful variants:
 
 ```bash
 ./test_setup/action.sh --sync-mode full
 ./test_setup/action.sh --payload-mb 4096
 ./test_setup/action.sh --progress-style bar
+./test_setup/action.sh --progress-style log --progress-interval 2
+./test_setup/action.sh --jobs 4
 ./test_setup/action.sh --keep-migration
 ./test_setup/action.sh --help
 ```
 
-## Bring the stack up
+Incremental synchronization and comprehensive verification are the defaults.
+The writer and reader intentionally remain running on the source after a
+successful story so the result can be inspected or another run can reuse the
+fixture.
+
+GitHub's independent `Validation` workflow runs this story in isolated Docker
+jobs for both synchronization modes with a 256 MiB fixture. CI cleanup removes
+only resources using the test project's fixed naming convention; local runs
+retain the source fixture as described above.
+
+## Manual setup
+
+Start both Compose files together:
 
 ```bash
-cd test_setup
-docker compose -f docker-compose.yml -f docker-compose.reader.yml up -d
-docker compose -f docker-compose.yml -f docker-compose.reader.yml ps
+docker compose \
+  -f test_setup/docker-compose.yml \
+  -f test_setup/docker-compose.reader.yml \
+  up -d
+
+docker compose \
+  -f test_setup/docker-compose.yml \
+  -f test_setup/docker-compose.reader.yml \
+  ps
+
 docker exec oci_hydrate_test_writer tail -n 5 /data/heartbeat.log
+docker logs oci_hydrate_test_reader --tail 6
 ```
 
-## Run the tool against it
-
-From the repo root:
+Inventory and preview from the repository root:
 
 ```bash
-# Discover the runtime volume name and current consumers
 ./scripts/oci-volume-hydrate.sh inventory \
   --compose-file test_setup/docker-compose.yml \
   --compose-file test_setup/docker-compose.reader.yml \
   --runtime docker
 
-# Validate a migration plan without changing anything
 ./scripts/oci-volume-hydrate.sh plan \
   --compose-file test_setup/docker-compose.yml \
   --compose-file test_setup/docker-compose.reader.yml \
   --source-volume oci_hydrate_test_demo_data \
   --runtime docker \
   --dry-run
+```
 
-# Hydrate for real (stops/restarts writer+reader, copies, verifies, does not cut over)
+Create a resumable migration, hydrate, and cut over:
+
+```bash
 ./scripts/oci-volume-hydrate.sh plan \
   --compose-file test_setup/docker-compose.yml \
   --compose-file test_setup/docker-compose.reader.yml \
   --source-volume oci_hydrate_test_demo_data \
   --runtime docker
-# note the printed MIGRATION_ID, then:
+
 ./scripts/oci-volume-hydrate.sh hydrate --migration-id MIGRATION_ID
+./scripts/oci-volume-hydrate.sh status   --migration-id MIGRATION_ID
+./scripts/oci-volume-hydrate.sh cutover  --migration-id MIGRATION_ID
+```
 
-# Cut services over to the verified destination
-./scripts/oci-volume-hydrate.sh cutover --migration-id MIGRATION_ID
+After writing test data on the destination, reverse-sync and return both
+services to the original source:
 
-# Confirm no heartbeat ticks were lost across the cutover
-docker exec oci_hydrate_test_writer tail -n 5 /data/heartbeat.log
-
-# Roll back to the original volume (reverse-syncs destination writes first)
+```bash
 ./scripts/oci-volume-hydrate.sh rollback --migration-id MIGRATION_ID
 ```
 
-## Tear down
+## Cleanup
+
+The story prunes only its own rolled-back destination and state unless
+`--keep-migration` is supplied. To stop the fixture afterward:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.reader.yml down
-docker volume rm oci_hydrate_test_demo_data  # only if you also want the data gone
+docker compose \
+  -f test_setup/docker-compose.yml \
+  -f test_setup/docker-compose.reader.yml \
+  down
 ```
 
-If a cutover was performed, also remove the hydrated destination volume once
-you're done, or run `./scripts/oci-volume-hydrate.sh prune --runtime docker
---retention-days 0 --dry-run` (then `--execute`) to clean up eligible
-migration state.
+The named source volume remains. Remove it only when its test data is no longer
+needed:
+
+```bash
+docker volume rm oci_hydrate_test_demo_data
+```
+
+For retained migration state, always preview pruning before execution:
+
+```bash
+./scripts/oci-volume-hydrate.sh prune --runtime docker --retention-days 0 --dry-run
+./scripts/oci-volume-hydrate.sh prune --runtime docker --retention-days 0 --execute
+```
